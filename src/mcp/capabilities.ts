@@ -1,0 +1,111 @@
+// mcp/capabilities.ts — canonical name/version/capabilities for the
+// `coord mcp` server. Centralized here so lifecycle / channel tests can
+// snapshot the exact same options the server is built from.
+
+import type { ServerOptions } from '@modelcontextprotocol/sdk/server/index.js';
+import type { Implementation } from '@modelcontextprotocol/sdk/types.js';
+
+export const SERVER_INFO: Implementation = {
+  name: 'coord',
+  // Tracks the package version. We don't read package.json here to keep
+  // the MCP module side-effect free; bump on every coord release.
+  // 0.1.0 — brief-022 ships unknown-state + boot ritual + offline-on-
+  //         shutdown. Real surface change visible to MCP hosts.
+  // 0.2.0 — brief-023 (status-file mtime refresh) + brief-024
+  //         (`journal/` folder + CLI verbs). MCP surface unchanged
+  //         (Phase 8 journal tools deferred), but the data-model
+  //         layout grows so peers see a new folder shape.
+  // 0.2.1 — brief-028 (lib API: coord.members / coord.overview /
+  //         coord.createIdentity + type re-exports). MCP surface
+  //         unchanged; library-only addition.
+  // 0.2.2 — brief-029 (`away` State, fifth settable). Additive
+  //         enum extension; coord_members filter enum picks it up
+  //         via STATES, no schema-bump beyond the new value.
+  // 0.3.0 — brief-030 (tidy-check tick): MCP server emits
+  //         synthetic notifications/claude/channel frames from
+  //         coord-system when drift is detected (stale inbox,
+  //         untouched doing-task, journal lag). Real feature,
+  //         hence the minor bump.
+  version: '0.3.0',
+};
+
+/** Phase-1 (no `--channel`) options: tools capability only. */
+export const SERVER_OPTIONS: ServerOptions = {
+  capabilities: {
+    tools: {},
+  },
+};
+
+/**
+ * Instructions sent to the host when channel mode is on. Defines the
+ * full boot ritual every connected agent runs so myobie's visibility
+ * surface — status files, inbox flow, tasks folder, journal — stays
+ * honest.
+ *
+ * Load-bearing substrings (asserted by tests/unit/channel-instructions
+ * regression guard): `available`, `coord status`, `coord_msg_ls`,
+ * `coord_msg_read`, `coord_msg_archive`, `coord_msg_reply`,
+ * `coord_members`, `coord task new`, `coord task status`,
+ * `coord task done`, `coord journal new`, `<channel source="coord"`.
+ */
+export const CHANNEL_INSTRUCTIONS = [
+  'You are connected to coord. This is myobie\'s visibility layer: they look at status files, inbox/archive, tasks/, and journal/ to understand what every agent is doing. Maintain those records.',
+  '',
+  'On first opportunity in a fresh context (cold start or /clear):',
+  '  1. Write `available` to your status file. Shell out: `coord status <your-identity> --set available`. Use $COORD_IDENTITY.',
+  '  2. Drain your inbox backlog. Call `coord_msg_ls` to enumerate filenames, then for each one `coord_msg_read` it, `coord_msg_reply` if appropriate, and `coord_msg_archive` to clear. Don\'t leave inbox items un-addressed.',
+  '  3. Check `coord_members` (with `enrich: true`) to see who\'s around and whether any peers are waiting on you.',
+  '',
+  'As work happens: every meaningful work item gets a task file. Shell out:',
+  '  - `coord task new "<title>"` when you start something with state or multiple steps.',
+  '  - `coord task status <filename> doing` while active.',
+  '  - `coord task done <filename>` when complete.',
+  '  This is how myobie and peer agents see what you\'re working on. Replying to a one-off ping doesn\'t need a task; implementing a brief, debugging, or running a multi-step verification does.',
+  '',
+  'As you make non-trivial progress, drop a terse `coord journal new "<body>"` entry. Audience is everyone else, not your own monologue — a few sentences saying what just landed and why. Good shape: "Shipped brief-NNN. Y was the load-bearing fix; Z stayed parked." NOT: a stream-of-thought log or step-by-step narrative — that belongs in a task body or a brief. Peers follow via `coord journal tail <your-identity>` without interrupting you.',
+  '',
+  'As channel notifications arrive: new peer messages appear in your context as `<channel source="coord" from="<sender>">…</channel>` blocks. For each one: `coord_msg_read` the cited filename, `coord_msg_reply` with `thread: <messageFilename>` and `body: <your reply>` if a response is warranted, then `coord_msg_archive` to clear. Don\'t let inbox accumulate.',
+  '',
+  'Tools you have via MCP: `coord_msg_send`, `coord_msg_reply`, `coord_msg_ls`, `coord_msg_read`, `coord_msg_archive`, `coord_msg_thread`, `coord_members`. For status, tasks, and journal, shell out to `coord status` / `coord task` / `coord tasks` / `coord journal` — no MCP tools for those yet.',
+].join('\n');
+
+/**
+ * Build {@link ServerOptions} for a given mode. Channel mode adds
+ * `experimental['claude/channel'] = {}` and an instructions string.
+ * Capabilities cannot be modified after `Server` construction, so this
+ * must run before {@link createMcpServer} instantiates the server.
+ */
+export function buildServerOptions(opts: {
+  channel: boolean;
+}): ServerOptions {
+  if (!opts.channel) return SERVER_OPTIONS;
+  return {
+    capabilities: {
+      tools: {},
+      experimental: {
+        'claude/channel': {},
+      },
+    },
+    instructions: CHANNEL_INSTRUCTIONS,
+  };
+}
+
+/** Non-channel tool set. Names prefixed `coord_msg_` per brief-017
+ * mark the message-group; `coord_members` (brief-019) is the first
+ * non-message tool. `coord_task_*` / `coord_overview` remain parked. */
+export const EXPECTED_TOOL_NAMES = [
+  'coord_msg_send',
+  'coord_msg_ls',
+  'coord_msg_read',
+  'coord_msg_archive',
+  'coord_msg_thread',
+  'coord_members',
+] as const;
+
+/** Channel-mode tool set: non-channel set + `coord_msg_reply`. */
+export const EXPECTED_TOOL_NAMES_CHANNEL = [
+  ...EXPECTED_TOOL_NAMES,
+  'coord_msg_reply',
+] as const;
+
+export type ToolName = (typeof EXPECTED_TOOL_NAMES_CHANNEL)[number];

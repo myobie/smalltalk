@@ -1,0 +1,245 @@
+// tests/unit/mcp/shared.test.ts — cross-cutting MCP-layer tests.
+//
+// Concurrent calls, pre-command sweep regression, tools/list integrity,
+// drift guard, identity plumbing.
+
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { EXPECTED_TOOL_NAMES } from '../../../src/mcp/capabilities.ts';
+import { createMcpServer } from '../../../src/mcp/index.ts';
+import { errorCode, errorPayload } from "./_helpers.ts";
+import { asIdentity } from '../../../src/types.ts';
+
+let scratch: string;
+let coordRoot: string;
+let client: Client;
+let handle: ReturnType<typeof createMcpServer>;
+
+beforeEach(async () => {
+  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-shared-'));
+  coordRoot = join(scratch, 'coord');
+  for (const id of ['alice', 'bob']) {
+    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  }
+  handle = createMcpServer({
+    root: coordRoot,
+    identity: asIdentity('alice'),
+  });
+  client = new Client({ name: 'test-shared', version: '1.0' });
+  const [c, s] = InMemoryTransport.createLinkedPair();
+  await Promise.all([client.connect(c), handle.mcp.connect(s)]);
+});
+afterEach(async () => {
+  await handle.close();
+  rmSync(scratch, { recursive: true, force: true });
+});
+
+interface CallResult {
+  isError?: boolean;
+  content?: Array<{ type: string; text?: string }>;
+  structuredContent?: Record<string, unknown>;
+}
+
+async function call(
+  name: string,
+  args: Record<string, unknown>
+): Promise<CallResult> {
+  return (await client.callTool({ name, arguments: args })) as CallResult;
+}
+
+// ─── tools/list integrity ──────────────────────────────────────────────
+
+describe('shared — tools/list', () => {
+  it('returns exactly the EXPECTED_TOOL_NAMES set, in any order', async () => {
+    const r = await client.listTools();
+    const names = r.tools.map((t) => t.name).sort();
+    expect(names).toEqual([...EXPECTED_TOOL_NAMES].sort());
+  });
+
+  it('every tool advertises an inputSchema with type=object', async () => {
+    const r = await client.listTools();
+    for (const tool of r.tools) {
+      expect(tool.inputSchema?.type).toBe('object');
+    }
+  });
+
+  it('every tool advertises an outputSchema (structuredContent contract)', async () => {
+    const r = await client.listTools();
+    for (const tool of r.tools) {
+      expect(tool.outputSchema).toBeDefined();
+    }
+  });
+
+  it('every tool has a description string', async () => {
+    const r = await client.listTools();
+    for (const tool of r.tools) {
+      expect(typeof tool.description).toBe('string');
+      expect((tool.description ?? '').length).toBeGreaterThan(0);
+    }
+  });
+
+  it('every tool has a title in annotations or as a top-level field', async () => {
+    const r = await client.listTools();
+    for (const tool of r.tools) {
+      // SDK may surface the title at the top level (newer spec) or inside
+      // annotations — either is fine.
+      const title = tool.title ?? tool.annotations?.title;
+      expect(typeof title).toBe('string');
+    }
+  });
+});
+
+// ─── Drift guard ──────────────────────────────────────────────────────
+
+describe('shared — drift guard (capabilities + tool list)', () => {
+  it('capabilities + tool list are identical before and after a sequence of tool calls', async () => {
+    const before = {
+      caps: client.getServerCapabilities(),
+      version: client.getServerVersion(),
+      tools: (await client.listTools()).tools.map((t) => t.name).sort(),
+    };
+
+    // Exercise multiple tools.
+    await call('coord_msg_send', { to: 'bob', body: 'msg1' });
+    await call('coord_msg_ls', {});
+    await call('coord_msg_send', { to: 'alice', body: 'msg2', from: 'bob' });
+
+    const after = {
+      caps: client.getServerCapabilities(),
+      version: client.getServerVersion(),
+      tools: (await client.listTools()).tools.map((t) => t.name).sort(),
+    };
+
+    expect(after).toEqual(before);
+  });
+});
+
+// ─── Concurrency ──────────────────────────────────────────────────────
+
+describe('shared — concurrent tool calls', () => {
+  it('10 parallel coord_msg_send calls produce 10 distinct files', async () => {
+    const calls = Array.from({ length: 10 }, (_, i) =>
+      call('coord_msg_send', { to: 'bob', body: `msg-${i}` })
+    );
+    const results = await Promise.all(calls);
+    const filenames = results
+      .map((r) => r.structuredContent?.filename as string)
+      .filter(Boolean);
+    expect(filenames).toHaveLength(10);
+    expect(new Set(filenames).size).toBe(10);
+    expect(readdirSync(join(coordRoot, 'bob', 'inbox'))).toHaveLength(10);
+  });
+
+  it('mixed parallel calls (send + ls + read) work without state corruption', async () => {
+    // Pre-populate one message so read has something to find.
+    const send0 = await call('coord_msg_send', { to: 'alice', body: 'seed', from: 'bob' });
+    const seedFn = send0.structuredContent?.filename as string;
+
+    const results = await Promise.all([
+      call('coord_msg_send', { to: 'bob', body: 'a' }),
+      call('coord_msg_send', { to: 'bob', body: 'b' }),
+      call('coord_msg_ls', {}),
+      call('coord_msg_ls', { identity: 'bob' }),
+      call('coord_msg_read', { filename: seedFn }),
+    ]);
+    for (const r of results) {
+      expect(r.isError).toBeUndefined();
+    }
+  });
+});
+
+// ─── Pre-command sweep regression ─────────────────────────────────────
+
+describe('shared — universal pre-command sweep', () => {
+  it('byte-identical inbox+archive twin is cleaned before any tool runs (read-only too)', async () => {
+    const f = '1714826789010-aaaaaa.md';
+    writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'same');
+    writeFileSync(join(coordRoot, 'alice', 'archive', f), 'same');
+
+    // coord_msg_ls is read-only at the API level; sweep must still fire.
+    const r = await call('coord_msg_ls', {});
+    expect(r.isError).toBeUndefined();
+    expect(r.structuredContent?.matches).toEqual([]);
+    expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(false);
+    expect(existsSync(join(coordRoot, 'alice', 'archive', f))).toBe(true);
+  });
+
+  it('sweep is idempotent under concurrent tool calls', async () => {
+    const f = '1714826789010-aaaaaa.md';
+    writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'same');
+    writeFileSync(join(coordRoot, 'alice', 'archive', f), 'same');
+
+    // 10 parallel calls — each fires the pre-command sweep. Final state
+    // unchanged; no errors.
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => call('coord_msg_ls', {}))
+    );
+    for (const r of results) expect(r.isError).toBeUndefined();
+    expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(false);
+    expect(existsSync(join(coordRoot, 'alice', 'archive', f))).toBe(true);
+  });
+});
+
+// ─── Identity plumbing ────────────────────────────────────────────────
+
+describe('shared — identity plumbing', () => {
+  it('bad COORD_IDENTITY at server construction → every tool surfaces IDENTITY_NOT_HOSTED', async () => {
+    // Tear down and rebuild against a missing identity.
+    await handle.close();
+    handle = createMcpServer({
+      root: coordRoot,
+      identity: asIdentity('ghost'), // valid grammar but no folder on disk
+    });
+    client = new Client({ name: 'test-shared-ghost', version: '1.0' });
+    const [c, s] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(c), handle.mcp.connect(s)]);
+
+    const cases = [
+      ['coord_msg_send', { to: 'bob', body: 'm' }],
+      ['coord_msg_ls', {}],
+      ['coord_msg_read', { filename: '1714826789010-aaaaaa.md' }],
+      ['coord_msg_archive', { filename: '1714826789010-aaaaaa.md' }],
+      ['coord_msg_thread', { filename: '1714826789010-aaaaaa.md' }],
+    ] as const;
+    for (const [name, args] of cases) {
+      const r = await call(name, args);
+      expect(r.isError).toBe(true);
+      expect(errorCode(r)).toBe('IDENTITY_NOT_HOSTED');
+    }
+  });
+});
+
+// ─── Error response shape regression ──────────────────────────────────
+
+describe('shared — error response shape', () => {
+  it('every CoordError surfaces with isError + content[0].text + _meta["coord/error"]', async () => {
+    // Trigger one of each error class via different tools.
+    const r1 = await call('coord_msg_send', { to: 'INVALID', body: 'm' });
+    expect(r1.isError).toBe(true);
+    expect((r1.content?.[0] as { text: string } | undefined)?.text).toMatch(
+      /^INVALID_IDENTITY:/
+    );
+    expect(errorPayload(r1)).toMatchObject({
+      code: 'INVALID_IDENTITY',
+    });
+    expect(r1.structuredContent).toBeUndefined();
+
+    const r2 = await call('coord_msg_archive', { filename: 'garbage' });
+    expect(r2.isError).toBe(true);
+    expect(errorCode(r2)).toBe('INVALID_FILENAME');
+    expect(r2.structuredContent).toBeUndefined();
+  });
+});

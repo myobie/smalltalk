@@ -1,0 +1,81 @@
+// mcp/tools/archive.ts — registers the `coord_msg_archive` MCP tool.
+//
+// Mirrors `coord.archive(identity, filename)`. Returns
+// { outcome: 'moved' | 'idempotent' } so embedders can distinguish
+// case-4 (clean rename) from case-2/0 (the file is already archived).
+
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { z } from 'zod';
+
+import { archiveDir, inboxDir } from '../../common.ts';
+import type { Coord } from '../../lib.ts';
+import { asFilename, asIdentity } from '../../types.ts';
+import {
+  buildToolResult,
+  withErrorMapping,
+} from '../error-mapping.ts';
+
+const archiveInputShape = {
+  filename: z
+    .string()
+    .describe('Message filename (LAYOUT-004 grammar). Required.'),
+  identity: z
+    .string()
+    .optional()
+    .describe(
+      "Whose folder to archive within. Defaults to $COORD_IDENTITY."
+    ),
+};
+
+const archiveOutputShape = {
+  filename: z.string(),
+  identity: z.string(),
+  outcome: z
+    .enum(['moved', 'idempotent'])
+    .describe(
+      "'moved' = case-4 clean rename, 'idempotent' = already archived (case 0 or case 2 byte-identical twin)."
+    ),
+};
+
+export function registerArchiveTool(mcp: McpServer, coord: Coord): void {
+  mcp.registerTool(
+    'coord_msg_archive',
+    {
+      title: 'Archive a coord message',
+      description:
+        "Equivalent to `coord message archive`. Move <identity>/inbox/<filename> to <identity>/archive/<filename>. Idempotent on a byte-identical twin; refuses on divergent twin (ARCHIVE_CONFLICT).",
+      inputSchema: archiveInputShape,
+      outputSchema: archiveOutputShape,
+    },
+    async (args) =>
+      withErrorMapping(async () => {
+        const filename = asFilename(args.filename);
+        const identity =
+          args.identity !== undefined
+            ? asIdentity(args.identity)
+            : coord.identity;
+        // The Coord.archive() return type is void; to surface "moved"
+        // vs "idempotent" we re-check the inbox before calling. If the
+        // file is already gone (post-sweep idempotent) AND the archive
+        // copy is present, that's the idempotent outcome; otherwise a
+        // successful call did the move.
+        const ipath = join(inboxDir(identity, coord.root), filename);
+        const apath = join(archiveDir(identity, coord.root), filename);
+        const wasPresent = existsSync(ipath);
+        const archivePresent = existsSync(apath);
+        await coord.archive(identity, filename);
+        const outcome: 'moved' | 'idempotent' =
+          wasPresent && !archivePresent ? 'moved' : 'idempotent';
+        const summary =
+          outcome === 'moved'
+            ? `archived: ${identity}/${filename}`
+            : `archived (idempotent): ${identity}/${filename}`;
+        return buildToolResult({
+          summary,
+          value: { filename, identity, outcome },
+        });
+      })
+  );
+}

@@ -1,0 +1,663 @@
+// lib.ts — embeddable createCoord({ root, identity, configRoot? }) factory.
+//
+// What CLI consumers get from `bin/coord` and what library consumers get
+// from `createCoord(...)` are functionally identical — the same code paths
+// in src/commands/ underpin both. Library consumers get:
+//
+// - A typed `Coord` handle with `{ root, identity, configRoot }` baked in.
+//   No env-var juggling per call.
+// - Promise-returning methods. Async-iterable `watch` for streaming.
+// - AbortSignal support on `watch` for cancellation.
+// - Branded `Identity` / `Filename` parameters that compile-error if you
+//   pass an unvalidated string.
+// - Typed errors (CoordError + subclasses) you can pattern-match on with
+//   instanceof or a stable `code` string.
+// - Zero stdout/stderr writes. The library returns values; the caller
+//   decides how to display them.
+//
+// Every method runs the universal pre-command sweep first (LAYOUT-defined
+// archive-as-tombstone invariant); the existing common.ts `sweep()` is
+// what does the work.
+
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+import { parseFrontmatter, sweep as runSweep } from './common.ts';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+
+import {
+  cmdArchive,
+  cmdArchiveTrim,
+} from './commands/archive.ts';
+import { cmdLs } from './commands/ls.ts';
+import {
+  getMembers,
+  type MemberSummary,
+  type MemberSummaryEnriched,
+} from './commands/members.ts';
+import {
+  getOverview,
+  type Overview,
+} from './commands/overview.ts';
+import { cmdRead } from './commands/read.ts';
+import { cmdSend } from './commands/send.ts';
+import { cmdStatus } from './commands/status.ts';
+import {
+  cmdSyncAll,
+  cmdSyncAllPull,
+  cmdSyncAllPush,
+  cmdSyncPull,
+  cmdSyncPush,
+  type RsyncResult,
+  type SyncContext,
+  type SyncDeps,
+} from './commands/sync.ts';
+import {
+  resolveWatchSetup,
+  watchPoll,
+  watchReplay,
+  type WatchInput,
+} from './commands/watch.ts';
+
+import {
+  archiveDir as archiveDirCommon,
+  ensureIdentityDirs,
+  inboxDir as inboxDirCommon,
+  validIdentity,
+} from './common.ts';
+import { InvalidIdentityError } from './errors.ts';
+import { spawnSync } from 'node:child_process';
+
+import {
+  asFilename,
+  asIdentity,
+  type Filename,
+  type Identity,
+  type MessageWithLocation,
+  type Peer,
+  type Priority,
+  type State,
+  type WatchEvent,
+} from './types.ts';
+
+// ─── Public option types ────────────────────────────────────────────────
+
+export interface CoordOptions {
+  /** $COORD_ROOT — the parent of every `<identity>/` folder. */
+  root: string;
+  /** Default identity for any method that doesn't take one explicitly. */
+  identity: Identity;
+  /** $COORD_CONFIG. Defaults to `~/.config/coord`. */
+  configRoot?: string;
+}
+
+export interface SendOptions {
+  /** Sender identity. Defaults to the Coord's `identity`. */
+  from?: Identity;
+  subject?: string;
+  inReplyTo?: Filename;
+  tags?: string[];
+  priority?: Priority;
+}
+
+export interface LsOptions {
+  archive?: boolean;
+  /** Only files whose <unix-ms> prefix is >= this value. */
+  since?: number;
+  /** Only files whose frontmatter `from:` equals this. */
+  fromFilter?: Identity;
+}
+
+export interface ReadOptions {
+  /** When true, prefer archive/ first; falls back to inbox. */
+  fromArchive?: boolean;
+}
+
+export interface TrimOptions {
+  /** Duration spec like `30d`, `12h`, `2w`. */
+  olderThan?: string;
+  /** Keep this many most-recent files; trim the rest. */
+  keepLast?: number;
+  /** When true, return the victim list without deleting. */
+  dryRun?: boolean;
+  /** Override now() for deterministic --older-than testing. */
+  now?: () => number;
+}
+
+export interface ThreadOptions {
+  /** Currently a stub (the underlying walk is global either way). */
+  tree?: boolean;
+}
+
+export interface WatchOptions {
+  withSubject?: boolean;
+  since?: number;
+  sinceNow?: boolean;
+  /** Polling interval in ms (default 500). */
+  intervalMs?: number;
+  /** AbortSignal to cancel the iterable. */
+  signal?: AbortSignal;
+  /**
+   * When true, watch every peer's inbox EXCEPT the Coord's own
+   * identity (cross-tree supervisor mode). Default is to watch
+   * the Coord's own identity inbox — same default as `coord watch`
+   * post-brief-017a. Mutually exclusive with the `identity` arg.
+   */
+  all?: boolean;
+}
+
+export interface SyncResult {
+  stdout: string;
+  stderr: string;
+}
+
+export interface FanOutItem {
+  peer: Peer;
+  ok: boolean;
+  stderr?: string;
+}
+
+export interface FanOutBidiItem {
+  peer: Peer;
+  pushOk: boolean;
+  pullOk: boolean;
+}
+
+// ─── Coord interface ────────────────────────────────────────────────────
+
+export interface Coord {
+  readonly root: string;
+  readonly identity: Identity;
+  readonly configRoot: string;
+
+  send(to: Identity, body: string | Buffer, opts?: SendOptions): Promise<Filename>;
+  ls(identity?: Identity, opts?: LsOptions): Promise<Filename[]>;
+  read(
+    identity: Identity,
+    filename: Filename,
+    opts?: ReadOptions
+  ): Promise<MessageWithLocation>;
+  archive(identity: Identity, filename: Filename): Promise<void>;
+  archiveTrim(identity: Identity, opts: TrimOptions): Promise<Filename[]>;
+  thread(
+    identity: Identity,
+    filename: Filename,
+    opts?: ThreadOptions
+  ): Promise<MessageWithLocation[]>;
+  watch(identity?: Identity, opts?: WatchOptions): AsyncIterable<WatchEvent>;
+  getStatus(identity: Identity): Promise<State>;
+  setStatus(identity: Identity, state: State): Promise<void>;
+  /**
+   * brief-028: enumerate identities under $COORD_ROOT. Mirrors
+   * `coord members` but returns the typed payload directly so an
+   * embedder can render their own UI without re-parsing.
+   */
+  members(opts?: {
+    status?: State;
+    enrich?: boolean;
+  }): MemberSummary[] | MemberSummaryEnriched[];
+  /**
+   * brief-028: at-a-glance dashboard for `identity` (defaults to the
+   * handle's own identity). Mirrors `coord overview`.
+   */
+  overview(opts?: { identity?: Identity; recent?: number }): Overview;
+  /**
+   * brief-028: idempotently mkdir `<root>/<name>/{inbox,archive}` so
+   * a new identity can host messages. Validates `name` via
+   * validIdentity — throws InvalidIdentityError for invalid or
+   * reserved names. Returns `{ created: true }` when at least one of
+   * the required folders was missing before the call, `{ created:
+   * false }` when both already existed.
+   */
+  createIdentity(name: string): Promise<{ created: boolean }>;
+  sweep(): Promise<{ removed: number }>;
+  sync: {
+    push(peer: Peer): Promise<SyncResult>;
+    pull(peer: Peer): Promise<SyncResult>;
+    pushAll(): Promise<FanOutItem[]>;
+    pullAll(): Promise<FanOutItem[]>;
+    all(): Promise<FanOutBidiItem[]>;
+  };
+}
+
+// ─── Factory ────────────────────────────────────────────────────────────
+
+const DEFAULT_INTERVAL_MS = 500;
+
+export function createCoord(options: CoordOptions): Coord {
+  const root = options.root;
+  const identity = asIdentity(options.identity);
+  const configRoot = options.configRoot ?? join(homedir(), '.config', 'coord');
+
+  const lib_env = {} as NodeJS.ProcessEnv; // empty: API never reads env
+
+  /** Run the universal pre-command sweep (matches CLI). */
+  function presweep(): void {
+    try {
+      runSweep(root);
+    } catch {
+      // best-effort
+    }
+  }
+
+  // Capturing rsync wrapper for the sync.* family. Both stdout and stderr
+  // are captured into the SyncResult/FanOut* return values; nothing leaks
+  // to process stdio.
+  const capturedRunRsync = (args: string[]): RsyncResult => {
+    const r = spawnSync('rsync', ['-a', ...args], {
+      stdio: ['inherit', 'pipe', 'pipe'],
+      encoding: 'utf8',
+    });
+    const result: RsyncResult = { status: r.status ?? -1 };
+    if (typeof r.stderr === 'string' && r.stderr.length > 0) {
+      result.stderr = r.stderr;
+    }
+    return result;
+  };
+
+  function makeSyncCtx(captured: { stdout: string; stderr: string }): SyncContext {
+    const deps: SyncDeps = {
+      runRsync: capturedRunRsync,
+      bannerSink: (line) => {
+        captured.stderr += `${line}\n`;
+      },
+    };
+    return { coordRoot: root, coordConfig: configRoot, deps };
+  }
+
+  const coord: Coord = {
+    root,
+    identity,
+    configRoot,
+
+    async send(to, body, opts = {}): Promise<Filename> {
+      presweep();
+      const r = cmdSend({
+        to,
+        from: opts.from ?? identity,
+        ...(opts.subject !== undefined && { subject: opts.subject }),
+        ...(opts.inReplyTo !== undefined && { inReplyTo: opts.inReplyTo }),
+        ...(opts.tags !== undefined && { tags: opts.tags }),
+        ...(opts.priority !== undefined && { priority: opts.priority }),
+        body,
+        env: lib_env,
+        coordRoot: root,
+      });
+      return asFilename(r.filename);
+    },
+
+    async ls(id?, opts = {}): Promise<Filename[]> {
+      presweep();
+      const r = cmdLs({
+        recipient: id ?? identity,
+        ...(opts.archive !== undefined && { archive: opts.archive }),
+        ...(opts.since !== undefined && { since: opts.since }),
+        ...(opts.fromFilter !== undefined && { fromFilter: opts.fromFilter }),
+        env: lib_env,
+        coordRoot: root,
+      });
+      return r.matches.map(asFilename);
+    },
+
+    async read(id, filename, opts = {}): Promise<MessageWithLocation> {
+      presweep();
+      const r = cmdRead({
+        recipient: id,
+        filename,
+        ...(opts.fromArchive !== undefined && { fromArchive: opts.fromArchive }),
+        env: lib_env,
+        coordRoot: root,
+      });
+      // Build a typed MessageWithLocation from cmdRead's result. cmdRead
+      // returns `{ body, header, label, path, untyped }` in formatted mode;
+      // we re-parse the file off disk to get the structured frontmatter
+      // (cmdRead's header is for human display).
+      const text = readFileSync(r.path, 'utf8');
+      const parsed = parseFrontmatter(text);
+      return toMessageWithLocation(
+        parsed.fm,
+        parsed.body,
+        id,
+        filename,
+        r.label
+      );
+    },
+
+    async archive(id, filename): Promise<void> {
+      presweep();
+      cmdArchive({
+        recipient: id,
+        filename,
+        env: lib_env,
+        coordRoot: root,
+      });
+    },
+
+    async archiveTrim(id, opts): Promise<Filename[]> {
+      presweep();
+      const r = cmdArchiveTrim({
+        recipient: id,
+        ...(opts.olderThan !== undefined && { olderThan: opts.olderThan }),
+        ...(opts.keepLast !== undefined && { keepLast: opts.keepLast }),
+        ...(opts.dryRun !== undefined && { dryRun: opts.dryRun }),
+        ...(opts.now !== undefined && { now: opts.now }),
+        env: lib_env,
+        coordRoot: root,
+      });
+      return r.victims.map(asFilename);
+    },
+
+    async thread(id, filename, opts = {}): Promise<MessageWithLocation[]> {
+      presweep();
+      // The dynamic import keeps the Promise<Module> circle-safe when
+      // bundlers tree-shake; static import works the same at runtime.
+      const { cmdThread } = await import('./commands/thread.ts');
+      const r = cmdThread({
+        recipient: id,
+        filename,
+        ...(opts.tree !== undefined && { tree: opts.tree }),
+        env: lib_env,
+        coordRoot: root,
+      });
+      // For each line, locate the file, parse it, and build a
+      // MessageWithLocation. We re-locate-anywhere because thread's lines
+      // don't carry the path/folder back.
+      const out: MessageWithLocation[] = [];
+      for (const line of r.lines) {
+        const located = locateAcrossIdentities(root, line.filename);
+        if (located === undefined) {
+          // Phantom (extremely unlikely after the cmdThread walk); skip.
+          continue;
+        }
+        const text = readFileSync(located.path, 'utf8');
+        const parsed = parseFrontmatter(text);
+        out.push(
+          toMessageWithLocation(
+            parsed.fm,
+            parsed.body,
+            asIdentity(located.identity),
+            asFilename(line.filename),
+            located.folder
+          )
+        );
+      }
+      return out;
+    },
+
+    watch(id?, opts = {}): AsyncIterable<WatchEvent> {
+      const watchInput: WatchInput = {
+        ...(id !== undefined && { recipient: id }),
+        ...(opts.all === true && { all: true }),
+        // The library's "who am I" comes from the Coord's identity.
+        // Pass it as fromExplicit so the resolver knows which folder
+        // is "self" — used both by the new default (singleId = self)
+        // and by the --all path's suppression target.
+        fromExplicit: identity,
+        ...(opts.withSubject !== undefined && { withSubject: opts.withSubject }),
+        ...(opts.since !== undefined && { since: opts.since }),
+        ...(opts.sinceNow !== undefined && { sinceNow: opts.sinceNow }),
+        intervalMs: opts.intervalMs ?? DEFAULT_INTERVAL_MS,
+        env: lib_env,
+        coordRoot: root,
+      };
+      return watchAsyncIterable(watchInput, opts.signal);
+    },
+
+    async getStatus(id): Promise<State> {
+      presweep();
+      const r = cmdStatus({
+        recipient: id,
+        env: lib_env,
+        coordRoot: root,
+      });
+      if (r.mode !== 'get') throw new Error('unreachable: getStatus mode');
+      return r.state;
+    },
+
+    async setStatus(id, state): Promise<void> {
+      presweep();
+      cmdStatus({
+        recipient: id,
+        setState: state,
+        env: lib_env,
+        coordRoot: root,
+      });
+    },
+
+    members(opts = {}): MemberSummary[] | MemberSummaryEnriched[] {
+      presweep();
+      return getMembers(root, {
+        ...(opts.status !== undefined && { status: opts.status }),
+        ...(opts.enrich !== undefined && { enrich: opts.enrich }),
+      });
+    },
+
+    overview(opts = {}): Overview {
+      presweep();
+      const target = opts.identity ?? identity;
+      return getOverview(root, target, {
+        ...(opts.recent !== undefined && { recent: opts.recent }),
+      });
+    },
+
+    async createIdentity(name): Promise<{ created: boolean }> {
+      if (!validIdentity(name)) {
+        throw new InvalidIdentityError(name);
+      }
+      const alreadyExisted =
+        existsSync(inboxDirCommon(name, root)) &&
+        existsSync(archiveDirCommon(name, root));
+      if (alreadyExisted) return { created: false };
+      ensureIdentityDirs(name, root);
+      return { created: true };
+    },
+
+    async sweep(): Promise<{ removed: number }> {
+      return runSweep(root);
+    },
+
+    sync: {
+      async push(peer): Promise<SyncResult> {
+        presweep();
+        const captured = { stdout: '', stderr: '' };
+        cmdSyncPush(peer, makeSyncCtx(captured));
+        return captured;
+      },
+      async pull(peer): Promise<SyncResult> {
+        presweep();
+        const captured = { stdout: '', stderr: '' };
+        cmdSyncPull(peer, makeSyncCtx(captured));
+        return captured;
+      },
+      async pushAll(): Promise<FanOutItem[]> {
+        presweep();
+        const captured = { stdout: '', stderr: '' };
+        const r = cmdSyncAllPush(makeSyncCtx(captured));
+        return [
+          ...r.successes.map((p) => ({ peer: p, ok: true })),
+          ...r.failures.map((f) => ({
+            peer: f.peer,
+            ok: false,
+            stderr: f.error,
+          })),
+        ];
+      },
+      async pullAll(): Promise<FanOutItem[]> {
+        presweep();
+        const captured = { stdout: '', stderr: '' };
+        const r = cmdSyncAllPull(makeSyncCtx(captured));
+        return [
+          ...r.successes.map((p) => ({ peer: p, ok: true })),
+          ...r.failures.map((f) => ({
+            peer: f.peer,
+            ok: false,
+            stderr: f.error,
+          })),
+        ];
+      },
+      async all(): Promise<FanOutBidiItem[]> {
+        presweep();
+        const captured = { stdout: '', stderr: '' };
+        const r = cmdSyncAll(makeSyncCtx(captured));
+        const items: FanOutBidiItem[] = r.successes.map((p) => ({
+          peer: p,
+          pushOk: true,
+          pullOk: true,
+        }));
+        // Failures from cmdSyncAll get duplicated push/pull entries; fold
+        // them: any peer that doesn't appear in `successes` had at least
+        // one direction fail.
+        const successSet = new Set(r.successes);
+        const failedPeers = new Set(
+          r.failures.map((f) => f.peer).filter((p) => !successSet.has(p))
+        );
+        for (const peer of failedPeers) {
+          items.push({ peer, pushOk: false, pullOk: false });
+        }
+        return items;
+      },
+    },
+  };
+
+  return coord;
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────
+
+function toMessageWithLocation(
+  fm: Record<string, unknown>,
+  body: string,
+  identity: Identity,
+  filename: Filename,
+  folder: 'inbox' | 'archive'
+): MessageWithLocation {
+  // Read-side permissive (LAYOUT-004): missing/malformed frontmatter is an
+  // untyped message — body is still readable, `from` is empty rather
+  // than throwing on validation. Branding is bypassed for the empty
+  // case so untyped files don't break the read API.
+  const fromRaw = typeof fm.from === 'string' ? fm.from : '';
+  const message: MessageWithLocation['message'] = {
+    from: (fromRaw === '' ? '' : asIdentity(fromRaw)) as Identity,
+    body,
+  };
+  if (typeof fm.subject === 'string' && fm.subject.length > 0) {
+    message.subject = fm.subject;
+  }
+  if (typeof fm['in-reply-to'] === 'string' && fm['in-reply-to'].length > 0) {
+    message.inReplyTo = asFilename(fm['in-reply-to']);
+  }
+  if (typeof fm.tags === 'string' && fm.tags.length > 0) {
+    // Stored shape is the raw `[a, b]` list scalar; embedders generally
+    // want a parsed array. Best-effort split: strip brackets, split on
+    // commas, trim and unquote each.
+    message.tags = parseTagsScalar(fm.tags);
+  } else if (Array.isArray(fm.tags)) {
+    message.tags = fm.tags.map((t) => String(t));
+  }
+  if (
+    typeof fm.priority === 'string' &&
+    (fm.priority === 'low' || fm.priority === 'normal' || fm.priority === 'high')
+  ) {
+    message.priority = fm.priority;
+  }
+  return { message, identity, filename, folder };
+}
+
+function parseTagsScalar(s: string): string[] {
+  const trimmed = s.replace(/^\[/, '').replace(/\]$/, '');
+  return trimmed
+    .split(',')
+    .map((t) => t.trim().replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1'))
+    .filter((t) => t.length > 0);
+}
+
+/** Locate a filename across every identity's inbox/archive under root. */
+function locateAcrossIdentities(
+  root: string,
+  filename: string
+):
+  | { path: string; identity: string; folder: 'inbox' | 'archive' }
+  | undefined {
+  let topEntries: string[];
+  try {
+    topEntries = readdirSync(root);
+  } catch {
+    return undefined;
+  }
+  for (const id of topEntries) {
+    for (const folder of ['inbox', 'archive'] as const) {
+      const candidate =
+        folder === 'inbox'
+          ? join(inboxDirCommon(id, root), filename)
+          : join(archiveDirCommon(id, root), filename);
+      if (existsSync(candidate)) {
+        return { path: candidate, identity: id, folder };
+      }
+    }
+  }
+  return undefined;
+}
+
+// ─── Watch async-iterable adapter ───────────────────────────────────────
+
+async function* watchAsyncIterable(
+  input: WatchInput,
+  signal: AbortSignal | undefined
+): AsyncIterable<WatchEvent> {
+  // Validate flags + resolve mode up front. Throws on bad input.
+  const { setup, intervalMs } = resolveWatchSetup(input);
+
+  if (signal?.aborted) return;
+
+  // Phase 1: replay.
+  const { lines, seen } = watchReplay(setup);
+  for (const line of lines) {
+    if (signal?.aborted) return;
+    yield toWatchEvent(line);
+  }
+
+  // Phase 2: poll loop.
+  while (!signal?.aborted) {
+    await sleepWithSignal(intervalMs, signal);
+    if (signal?.aborted) return;
+    const polled = watchPoll(setup, seen);
+    for (const line of polled.lines) {
+      if (signal?.aborted) return;
+      yield toWatchEvent(line);
+    }
+  }
+}
+
+function toWatchEvent(line: {
+  filename: string;
+  identity: string;
+  subject?: string;
+}): WatchEvent {
+  const ev: WatchEvent = {
+    filename: asFilename(line.filename),
+    identity: asIdentity(line.identity),
+    folder: 'inbox',
+  };
+  if (line.subject !== undefined) ev.subject = line.subject;
+  return ev;
+}
+
+function sleepWithSignal(
+  ms: number,
+  signal: AbortSignal | undefined
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const t = setTimeout(resolve, ms);
+    if (signal !== undefined) {
+      const onAbort = (): void => {
+        clearTimeout(t);
+        resolve();
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}

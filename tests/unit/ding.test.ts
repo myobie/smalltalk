@@ -1,0 +1,1422 @@
+// tests/unit/ding.test.ts — coord ding daemon state machine.
+//
+// Drives runDing with a fake Coord (controllable watch queue +
+// settable status) and a fake PtySender so the busy-buffer-flush
+// behavior is testable without a real pty subprocess or filesystem.
+
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  STALE_DOING_TASK_MS,
+  STALE_INBOX_MS,
+  STALE_JOURNAL_MS,
+} from '../../src/common.ts';
+import {
+  buildPtySendArgs,
+  cmdDingCli,
+  runDing,
+  type PtySender,
+} from '../../src/commands/ding.ts';
+import type { Coord, ReadOptions, WatchOptions } from '../../src/lib.ts';
+import {
+  asFilename,
+  asIdentity,
+  type Filename,
+  type Identity,
+  type MessageWithLocation,
+  type State,
+  type WatchEvent,
+} from '../../src/types.ts';
+
+// ─── Fakes ──────────────────────────────────────────────────────────────
+
+interface FakeCoord {
+  coord: Coord;
+  pushEvent(filename: string, opts?: { folder?: 'inbox' | 'archive' }): void;
+  endWatch(): void;
+  setStatus(state: State): void;
+  setMessage(filename: string, msg: { from: string; subject?: string }): void;
+  setReadError(err: Error): void;
+  setStatusError(err: Error): void;
+}
+
+function makeFakeCoord(
+  identity: Identity = asIdentity('bob'),
+  root = '/fake'
+): FakeCoord {
+  const queue: WatchEvent[] = [];
+  let waiter: ((v: void) => void) | undefined;
+  let ended = false;
+  let status: State = 'available';
+  let statusError: Error | undefined;
+  const messages = new Map<string, { from: string; subject?: string }>();
+  let readError: Error | undefined;
+
+  const watch = (
+    _id?: Identity,
+    opts: WatchOptions = {}
+  ): AsyncIterable<WatchEvent> => {
+    return {
+      [Symbol.asyncIterator](): AsyncIterator<WatchEvent> {
+        const onAbort = (): void => {
+          ended = true;
+          waiter?.();
+          waiter = undefined;
+        };
+        opts.signal?.addEventListener('abort', onAbort);
+        return {
+          async next(): Promise<IteratorResult<WatchEvent>> {
+            while (queue.length === 0 && !ended) {
+              await new Promise<void>((resolve) => {
+                waiter = resolve;
+              });
+            }
+            if (queue.length > 0) {
+              const value = queue.shift()!;
+              return { value, done: false };
+            }
+            return { value: undefined as never, done: true };
+          },
+          async return(): Promise<IteratorResult<WatchEvent>> {
+            ended = true;
+            return { value: undefined as never, done: true };
+          },
+        };
+      },
+    };
+  };
+
+  const coord: Partial<Coord> = {
+    root,
+    identity,
+    configRoot: `${root}/cfg`,
+    watch,
+    async getStatus(_id: Identity): Promise<State> {
+      if (statusError) throw statusError;
+      return status;
+    },
+    async read(
+      _id: Identity,
+      filename: Filename,
+      _opts?: ReadOptions
+    ): Promise<MessageWithLocation> {
+      if (readError) throw readError;
+      const msg = messages.get(filename);
+      if (msg === undefined) {
+        throw new Error(`fake: no message planted for ${filename}`);
+      }
+      return {
+        message: {
+          from: msg.from === '' ? ('' as Identity) : asIdentity(msg.from),
+          body: 'body',
+          ...(msg.subject !== undefined && { subject: msg.subject }),
+        },
+        identity: asIdentity('bob'),
+        filename,
+        folder: 'inbox',
+      };
+    },
+  };
+
+  return {
+    coord: coord as Coord,
+    pushEvent(filename, opts = {}): void {
+      queue.push({
+        filename: asFilename(filename),
+        identity,
+        folder: opts.folder ?? 'inbox',
+      });
+      waiter?.();
+      waiter = undefined;
+    },
+    endWatch(): void {
+      ended = true;
+      waiter?.();
+      waiter = undefined;
+    },
+    setStatus(s): void {
+      status = s;
+    },
+    setMessage(filename, m): void {
+      messages.set(filename, m);
+    },
+    setReadError(err): void {
+      readError = err;
+    },
+    setStatusError(err): void {
+      statusError = err;
+    },
+  };
+}
+
+interface FakeSender {
+  send: PtySender;
+  calls(): { sessionName: string; sequences: string[] }[];
+  failNext(reason: string, status?: number): void;
+}
+
+function makeFakeSender(): FakeSender {
+  const calls: { sessionName: string; sequences: string[] }[] = [];
+  let queuedFailure:
+    | { reason: string; status: number }
+    | undefined;
+  return {
+    send: async (sessionName, sequences) => {
+      calls.push({ sessionName, sequences: [...sequences] });
+      if (queuedFailure) {
+        const { reason, status } = queuedFailure;
+        queuedFailure = undefined;
+        return { status, stderr: reason };
+      }
+      return { status: 0, stderr: '' };
+    },
+    calls: () => calls,
+    failNext(reason, status = 1): void {
+      queuedFailure = { reason, status };
+    },
+  };
+}
+
+// ─── runDing — schema/setup boilerplate ────────────────────────────────
+
+interface RunningDing {
+  ac: AbortController;
+  done: Promise<void>;
+}
+
+function startDing(opts: {
+  coord: Coord;
+  identity?: Identity;
+  ptySession?: string;
+  ptySend: PtySender;
+  intervalMs?: number;
+  tidyIntervalMs?: number;
+  tidyNow?: () => number;
+  exitWhenSessionGone?: boolean;
+  sessionWatchIntervalMs?: number;
+  isSessionAlive?: (s: string) => boolean;
+  statusRefreshIntervalMs?: number;
+  stderr?: (s: string) => void;
+}): RunningDing {
+  const ac = new AbortController();
+  const done = runDing({
+    coord: opts.coord,
+    identity: opts.identity ?? asIdentity('bob'),
+    ptySession: opts.ptySession ?? 'codex-foo',
+    ptySend: opts.ptySend,
+    intervalMs: opts.intervalMs ?? 50,
+    // Default tidy off so existing inbox-arrival tests don't get
+    // surprise tidy-check emits mixed into their sender call lists.
+    tidyIntervalMs: opts.tidyIntervalMs ?? 0,
+    ...(opts.tidyNow !== undefined && { tidyNow: opts.tidyNow }),
+    // Default the session-alive probe to "always alive" so existing
+    // tests aren't subject to the brief-031-amendment teardown
+    // unless they explicitly opt in.
+    exitWhenSessionGone: opts.exitWhenSessionGone ?? true,
+    sessionWatchIntervalMs: opts.sessionWatchIntervalMs ?? 10_000,
+    isSessionAlive: opts.isSessionAlive ?? (() => true),
+    // brief-032: default status-refresh OFF so non-relevant tests
+    // don't have their status fixtures rewritten under them. The
+    // refresh describe block opts in explicitly.
+    statusRefreshIntervalMs: opts.statusRefreshIntervalMs ?? 0,
+    signal: ac.signal,
+    ...(opts.stderr !== undefined && { stderr: opts.stderr }),
+  });
+  return { ac, done };
+}
+
+async function settle(): Promise<void> {
+  // Two macrotasks gives the watcher loop a chance to consume the
+  // pushed event AND the await chain inside onEvent to resolve.
+  await new Promise((r) => setTimeout(r, 5));
+  await new Promise((r) => setTimeout(r, 5));
+}
+
+// ─── runDing — status gating ────────────────────────────────────────────
+
+describe('runDing — status gating', () => {
+  let fake: FakeCoord;
+  let sender: FakeSender;
+
+  beforeEach(() => {
+    fake = makeFakeCoord();
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+  });
+
+  it('available status → send fires immediately', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-aaaaaa.md', {
+      from: 'alice',
+      subject: 'hello',
+    });
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(1);
+    expect(sender.calls()[0]!.sessionName).toBe('codex-foo');
+    expect(sender.calls()[0]!.sequences).toEqual([
+      'you have a new coord message: hello (from alice); check your inbox',
+      'key:return',
+    ]);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('offline status → send fires (offline means "agent might pick it up")', async () => {
+    fake.setStatus('offline');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('busy status → send is suppressed', async () => {
+    fake.setStatus('busy');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(0);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('dnd status → send is suppressed', async () => {
+    fake.setStatus('dnd');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(0);
+    r.ac.abort();
+    await r.done;
+  });
+});
+
+// ─── runDing — buffering + flush ────────────────────────────────────────
+
+describe('runDing — buffering across busy → available', () => {
+  let fake: FakeCoord;
+  let sender: FakeSender;
+
+  beforeEach(() => {
+    fake = makeFakeCoord();
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+  });
+
+  it('two events while busy, one send after flip → both delivered in order', async () => {
+    fake.setStatus('busy');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice', subject: 'one' });
+    fake.setMessage('1714826789020-bbbbbb.md', { from: 'alice', subject: 'two' });
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      intervalMs: 30,
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await settle();
+    fake.pushEvent('1714826789020-bbbbbb.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(0);
+
+    fake.setStatus('available');
+    // Wait for the next status-tick to flush.
+    await new Promise((res) => setTimeout(res, 80));
+
+    expect(sender.calls()).toHaveLength(2);
+    expect(sender.calls()[0]!.sequences[0]).toContain('one');
+    expect(sender.calls()[1]!.sequences[0]).toContain('two');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('flush only happens once the status flips — busy still suppresses pre-flip arrivals', async () => {
+    fake.setStatus('busy');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice', subject: 'q' });
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      intervalMs: 25,
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await new Promise((res) => setTimeout(res, 100));
+    expect(sender.calls()).toHaveLength(0); // still buffered
+    fake.setStatus('available');
+    await new Promise((res) => setTimeout(res, 80));
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('events that arrive while available do not enter the buffer', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await settle();
+    fake.setStatus('busy'); // shouldn't affect the already-delivered event
+    await settle();
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+});
+
+// ─── runDing — pty send failures ────────────────────────────────────────
+
+describe('runDing — pty send failures', () => {
+  let fake: FakeCoord;
+  let sender: FakeSender;
+  let stderr: string;
+
+  beforeEach(() => {
+    fake = makeFakeCoord();
+    sender = makeFakeSender();
+    stderr = '';
+  });
+  afterEach(() => {
+    fake.endWatch();
+  });
+
+  it('non-zero pty exit → logs warning, daemon keeps watching', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice', subject: 'a' });
+    fake.setMessage('1714826789020-bbbbbb.md', { from: 'alice', subject: 'b' });
+    sender.failNext('session not found', 7);
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      stderr: (s) => {
+        stderr += s;
+      },
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(1);
+    expect(stderr).toMatch(/coord ding: pty send to "codex-foo" exited 7/);
+    expect(stderr).toMatch(/session not found/);
+
+    // Daemon is still alive — second event delivers.
+    fake.pushEvent('1714826789020-bbbbbb.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(2);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('pty subprocess throws → logs warning, daemon keeps watching', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice', subject: 'x' });
+    let throwOnce = true;
+    const send: PtySender = async (sessionName, sequences) => {
+      if (throwOnce) {
+        throwOnce = false;
+        throw new Error('spawn EACCES');
+      }
+      return { status: 0, stderr: '' };
+    };
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: send,
+      stderr: (s) => {
+        stderr += s;
+      },
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await settle();
+    expect(stderr).toMatch(/spawn EACCES/);
+    r.ac.abort();
+    await r.done;
+  });
+});
+
+// ─── runDing — read failures ───────────────────────────────────────────
+
+describe('runDing — coord.read failures', () => {
+  let fake: FakeCoord;
+  let sender: FakeSender;
+  let stderr: string;
+
+  beforeEach(() => {
+    fake = makeFakeCoord();
+    sender = makeFakeSender();
+    stderr = '';
+  });
+  afterEach(() => {
+    fake.endWatch();
+  });
+
+  it('read failure → logs and drops; subsequent events still flow', async () => {
+    fake.setStatus('available');
+    fake.setReadError(new Error('disk fell over'));
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      stderr: (s) => {
+        stderr += s;
+      },
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(0);
+    expect(stderr).toMatch(/coord ding: read failed/);
+    expect(stderr).toMatch(/disk fell over/);
+    r.ac.abort();
+    await r.done;
+  });
+});
+
+// ─── runDing — abort cleanup ───────────────────────────────────────────
+
+describe('runDing — abort + signal cleanup', () => {
+  it('abort resolves runDing and clears the buffer-flush timer', async () => {
+    const fake = makeFakeCoord();
+    const sender = makeFakeSender();
+    fake.setStatus('busy');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      intervalMs: 25,
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md'); // gets buffered
+    await settle();
+    expect(sender.calls()).toHaveLength(0);
+    r.ac.abort();
+    // runDing should resolve within a tight window.
+    await Promise.race([
+      r.done,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('runDing did not resolve')), 1000)
+      ),
+    ]);
+    // Even after a brief delay — flushing the timer should NOT fire
+    // any more sends.
+    await new Promise((res) => setTimeout(res, 60));
+    expect(sender.calls()).toHaveLength(0);
+  });
+
+  it('drops the AsyncIterable cleanly when the watcher ends', async () => {
+    const fake = makeFakeCoord();
+    const sender = makeFakeSender();
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    fake.endWatch();
+    await Promise.race([
+      r.done,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('runDing did not resolve')), 1000)
+      ),
+    ]);
+  });
+});
+
+// ─── cmdDingCli — arg parsing ──────────────────────────────────────────
+
+describe('cmdDingCli — arg parsing', () => {
+  function ctx(env: NodeJS.ProcessEnv = {}): {
+    env: NodeJS.ProcessEnv;
+    coordRoot: string;
+    coordConfig: string;
+    stdout: () => void;
+    stderr: (s: string) => void;
+    readStdin: () => Promise<Buffer>;
+    stderrBuf: { value: string };
+  } {
+    const stderrBuf = { value: '' };
+    return {
+      env,
+      coordRoot: '/tmp/fake-coord',
+      coordConfig: '/tmp/fake-cfg',
+      stdout: () => {},
+      stderr: (s) => {
+        stderrBuf.value += s;
+      },
+      readStdin: async () => Buffer.from(''),
+      stderrBuf,
+    };
+  }
+
+  it('--help prints usage and returns 0', async () => {
+    const c = ctx();
+    const code = await cmdDingCli(['--help'], c);
+    expect(code).toBe(0);
+    expect(c.stderrBuf.value).toMatch(/usage: coord ding/);
+  });
+
+  it('missing pty-session → throws', async () => {
+    await expect(cmdDingCli([], ctx())).rejects.toThrow(/requires a/);
+  });
+
+  it('unknown flag → throws', async () => {
+    await expect(cmdDingCli(['--bogus'], ctx())).rejects.toThrow(/unknown flag/);
+  });
+
+  it('extra positional → throws', async () => {
+    await expect(cmdDingCli(['a', 'b'], ctx())).rejects.toThrow(
+      /unexpected positional/
+    );
+  });
+
+  it('--interval requires integer', async () => {
+    await expect(
+      cmdDingCli(['session', '--interval', 'abc'], ctx({ COORD_IDENTITY: 'bob' }))
+    ).rejects.toThrow(/--interval must be a positive integer/);
+  });
+
+  it('missing identity (no --identity, no $COORD_IDENTITY) → throws', async () => {
+    // Don't actually start the watcher; provide a session arg, no identity.
+    await expect(cmdDingCli(['session'], ctx())).rejects.toThrow(
+      /needs --identity ID or \$COORD_IDENTITY/
+    );
+  });
+
+  it('invalid identity grammar → throws (caught at asIdentity)', async () => {
+    // INVALID has uppercase; asIdentity rejects.
+    await expect(
+      cmdDingCli(['session', '--identity', 'INVALID'], ctx())
+    ).rejects.toThrow(/invalid identity/i);
+  });
+
+  it('--tidy-interval-ms requires non-negative integer', async () => {
+    await expect(
+      cmdDingCli(
+        ['session', '--tidy-interval-ms', 'abc'],
+        ctx({ COORD_IDENTITY: 'bob' })
+      )
+    ).rejects.toThrow(/--tidy-interval-ms must be a non-negative integer/);
+  });
+});
+
+// ─── runDing — tidy-check tick (brief-031) ─────────────────────────────
+//
+// These tests point the fake Coord's `root` at a real /tmp scratch
+// dir so `evaluateDrift` (a real filesystem walk) can read planted
+// inbox/tasks/journal files. The watch/read/getStatus fakes are
+// unchanged — drift detection doesn't go through those methods.
+
+describe('runDing — tidy-check tick', () => {
+  let scratch: string;
+  let coordRoot: string;
+  let identityRoot: string;
+  let fake: FakeCoord;
+  let sender: FakeSender;
+  const IDENTITY = 'bob';
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), 'coord-ding-tidy-'));
+    coordRoot = join(scratch, 'coord');
+    mkdirSync(join(coordRoot, IDENTITY, 'inbox'), { recursive: true });
+    mkdirSync(join(coordRoot, IDENTITY, 'archive'), { recursive: true });
+    identityRoot = join(coordRoot, IDENTITY);
+    fake = makeFakeCoord(asIdentity(IDENTITY), coordRoot);
+    sender = makeFakeSender();
+    // brief-035 t2: write a current-mtime status file so the
+    // scan-on-startup considers all pre-planted tidy fixtures already
+    // handled. These tests target the tidy-check tick specifically;
+    // the new scan-on-startup describe block covers the replay path.
+    writeFileSync(join(identityRoot, 'status'), 'available\n');
+  });
+  afterEach(() => {
+    fake.endWatch();
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  function plantInbox(filename: string, ageMs: number): string {
+    const path = join(identityRoot, 'inbox', filename);
+    writeFileSync(path, '---\nfrom: alice\n---\nbody\n');
+    if (ageMs > 0) {
+      const t = new Date(Date.now() - ageMs);
+      utimesSync(path, t, t);
+    }
+    return path;
+  }
+  function plantTask(
+    filename: string,
+    status: 'todo' | 'doing' | 'done' | 'blocked',
+    title: string,
+    ageMs: number
+  ): string {
+    const dir = join(identityRoot, 'tasks');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, filename);
+    writeFileSync(path, `---\nstatus: ${status}\n---\n# ${title}\n`);
+    if (ageMs > 0) {
+      const t = new Date(Date.now() - ageMs);
+      utimesSync(path, t, t);
+    }
+    return path;
+  }
+
+  it('stale inbox → tidy line fires on first tick', async () => {
+    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
+    fake.setStatus('available');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 30,
+    });
+    // wait for at least one tidy tick
+    await new Promise((res) => setTimeout(res, 80));
+    expect(sender.calls()).toHaveLength(1);
+    const call = sender.calls()[0]!;
+    expect(call.sessionName).toBe('codex-foo');
+    expect(call.sequences[0]).toMatch(
+      /^coord tidy-check: inbox=1 \(oldest [0-9]+m\)\.$/
+    );
+    expect(call.sequences[1]).toBe('key:return');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('same drift across multiple ticks → only one tidy emit (dedup)', async () => {
+    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
+    fake.setStatus('available');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 30,
+    });
+    // give several ticks
+    await new Promise((res) => setTimeout(res, 250));
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('drift clears then re-emerges → second tidy emit', async () => {
+    const filename = '1714826789010-aaaaaa.md';
+    plantInbox(filename, STALE_INBOX_MS + 60_000);
+    fake.setStatus('available');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 30,
+    });
+    await new Promise((res) => setTimeout(res, 80));
+    expect(sender.calls()).toHaveLength(1);
+
+    // Clear (simulating archive); wait a tick so lastFired drops.
+    rmSync(join(identityRoot, 'inbox', filename));
+    await new Promise((res) => setTimeout(res, 80));
+    // Still one (no new emit when drift clears).
+    expect(sender.calls()).toHaveLength(1);
+
+    // Re-introduce drift.
+    plantInbox('1714826789020-bbbbbb.md', STALE_INBOX_MS + 60_000);
+    await new Promise((res) => setTimeout(res, 80));
+    expect(sender.calls()).toHaveLength(2);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('busy → no emit, lastFired untouched; flip to available catches up', async () => {
+    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
+    fake.setStatus('busy');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 30,
+    });
+    await new Promise((res) => setTimeout(res, 150));
+    expect(sender.calls()).toHaveLength(0);
+
+    // Flip; the next tick sees lastFired.inbox still false and
+    // emits.
+    fake.setStatus('available');
+    await new Promise((res) => setTimeout(res, 80));
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('dnd → no emit', async () => {
+    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
+    fake.setStatus('dnd');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 30,
+    });
+    await new Promise((res) => setTimeout(res, 150));
+    expect(sender.calls()).toHaveLength(0);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('unknown → no emit (tidy gate adds unknown beyond SUPPRESS_STATES)', async () => {
+    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
+    fake.setStatus('unknown');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 30,
+    });
+    await new Promise((res) => setTimeout(res, 150));
+    expect(sender.calls()).toHaveLength(0);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('away → emit still fires (away does NOT suppress, parallel to brief-029)', async () => {
+    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
+    fake.setStatus('away');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 30,
+    });
+    await new Promise((res) => setTimeout(res, 80));
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('combination: inbox + doing-task → both appear in the line', async () => {
+    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
+    plantTask(
+      '1714826789020-refactor-x.md',
+      'doing',
+      'refactor X',
+      STALE_DOING_TASK_MS + 60_000
+    );
+    fake.setStatus('available');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 30,
+    });
+    await new Promise((res) => setTimeout(res, 80));
+    expect(sender.calls()).toHaveLength(1);
+    const line = sender.calls()[0]!.sequences[0]!;
+    expect(line).toContain('inbox=1');
+    expect(line).toContain('doing-task "refactor X" untouched');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('tidyIntervalMs: 0 → no tidy tick at all (push-only mode)', async () => {
+    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
+    fake.setStatus('available');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 0,
+    });
+    await new Promise((res) => setTimeout(res, 150));
+    expect(sender.calls()).toHaveLength(0);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('inbox-arrival notice and tidy notice coexist (independent triggers)', async () => {
+    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
+    fake.setMessage('1714826789030-cccccc.md', {
+      from: 'alice',
+      subject: 'live ping',
+    });
+    fake.setStatus('available');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 30,
+    });
+    // tidy fires
+    await new Promise((res) => setTimeout(res, 80));
+    // inbox arrival
+    fake.pushEvent('1714826789030-cccccc.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(2);
+    const lines = sender.calls().map((c) => c.sequences[0]!);
+    expect(
+      lines.some((l) => l.startsWith('coord tidy-check:'))
+    ).toBe(true);
+    expect(
+      lines.some((l) =>
+        l.startsWith('you have a new coord message:')
+      )
+    ).toBe(true);
+    r.ac.abort();
+    await r.done;
+  });
+
+  // brief-031 amendment — separate describe at end of file.
+  // (Defined as a sibling test at the end of this describe so the
+  // scratch + fake fixtures are still in scope.)
+
+  it('opts.tidyNow injects a deterministic clock for drift age', async () => {
+    // Plant a journal entry old enough that drift would NOT fire
+    // with real Date.now (recent file mtime), but ages past
+    // STALE_JOURNAL_MS under a clock advanced 2h into the future.
+    const tdir = join(identityRoot, 'tasks');
+    mkdirSync(tdir, { recursive: true });
+    const donePath = join(tdir, '1714826789010-done.md');
+    writeFileSync(donePath, '---\nstatus: done\n---\n# shipped\n');
+    // No journal at all + a done task → tidy fires for journal lag
+    // once we move the clock forward. Without tidyNow, this test
+    // would still fire because the journal-lag baseline (no entries)
+    // makes age > STALE_JOURNAL_MS trivially true. The point of the
+    // injected clock is showing the seam works at all.
+    fake.setStatus('available');
+    const fixed = Date.now() + 2 * 60 * 60_000;
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      tidyIntervalMs: 30,
+      tidyNow: () => fixed,
+    });
+    await new Promise((res) => setTimeout(res, 80));
+    expect(sender.calls()).toHaveLength(1);
+    expect(sender.calls()[0]!.sequences[0]).toContain('no journal');
+    r.ac.abort();
+    await r.done;
+  });
+});
+
+// ─── runDing — session-watch (brief-031 amendment) ──────────────────────
+//
+// The amendment adds: ding periodically checks whether the target pty
+// session is still alive; if not, it aborts the watcher and exits
+// cleanly. Default ON; opt-out via `--no-exit-when-session-gone`.
+// These tests inject `isSessionAlive` directly rather than mocking
+// the pid-file probe.
+
+describe('runDing — session-watch (exits when session is gone)', () => {
+  let fake: FakeCoord;
+  let sender: FakeSender;
+
+  beforeEach(() => {
+    fake = makeFakeCoord();
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+  });
+
+  it('session stays alive → ding keeps running', async () => {
+    fake.setStatus('available');
+    let aliveCallCount = 0;
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 30,
+      isSessionAlive: () => {
+        aliveCallCount++;
+        return true;
+      },
+    });
+    await new Promise((res) => setTimeout(res, 150));
+    // Several alive checks have fired and ding has not exited.
+    expect(aliveCallCount).toBeGreaterThan(1);
+    // Aborting still works — we end the test normally, not via
+    // the session-watch path.
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('session goes away → ding exits cleanly on the next tick', async () => {
+    fake.setStatus('available');
+    let alive = true;
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 30,
+      isSessionAlive: () => alive,
+    });
+    // Let the watcher attach + the first tick(s) confirm alive.
+    await new Promise((res) => setTimeout(res, 80));
+    // Flip "dead." Next tick should abort internalAc → the
+    // for-await loop ends → runDing resolves without `r.ac.abort()`.
+    alive = false;
+    await Promise.race([
+      r.done,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('ding did not exit')), 500)),
+    ]);
+    // No external abort needed; runDing already returned.
+  });
+
+  it('exitWhenSessionGone: false → ding stays running even when session is gone', async () => {
+    fake.setStatus('available');
+    let aliveCallCount = 0;
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 30,
+      exitWhenSessionGone: false,
+      isSessionAlive: () => {
+        aliveCallCount++;
+        return false; // session is gone, but we opted out of the exit behavior
+      },
+    });
+    await new Promise((res) => setTimeout(res, 150));
+    // The probe was never even invoked because the watch is disabled
+    // when exitWhenSessionGone is false.
+    expect(aliveCallCount).toBe(0);
+    // External abort still works (regression: we don't break the
+    // normal teardown path).
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('isSessionAlive throws → ding is conservative and keeps running', async () => {
+    fake.setStatus('available');
+    let probeCallCount = 0;
+    const log: string[] = [];
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 30,
+      isSessionAlive: () => {
+        probeCallCount++;
+        throw new Error('EACCES: permission denied');
+      },
+      stderr: (s) => log.push(s),
+    });
+    await new Promise((res) => setTimeout(res, 150));
+    expect(probeCallCount).toBeGreaterThan(0);
+    expect(log.join('')).toContain('session-alive check failed');
+    // Probe failure is logged but ding keeps running — not a forced
+    // exit, since we don't know the actual session state.
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('external AbortController still works (regression)', async () => {
+    fake.setStatus('available');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 5_000, // long; not the trigger
+      isSessionAlive: () => true,
+    });
+    await new Promise((res) => setTimeout(res, 50));
+    r.ac.abort();
+    await r.done; // resolves promptly
+  });
+
+  it('CLI: --no-exit-when-session-gone is accepted (no throw)', async () => {
+    // Just verify the flag parses cleanly; the full daemon path
+    // requires a real pty subprocess so we can't smoke the wire.
+    // Confirm via the cmdDingCli arg parser via an isolated invocation
+    // that fails on missing $COORD_IDENTITY (proves parsing reached
+    // identity validation, i.e., the flag itself didn't blow up).
+    await expect(
+      cmdDingCli(['session', '--no-exit-when-session-gone'], {
+        env: {} as NodeJS.ProcessEnv,
+        coordRoot: '/tmp',
+        coordConfig: '/tmp',
+        stdout: () => {},
+        stderr: () => {},
+        readStdin: async () => Buffer.alloc(0),
+      })
+    ).rejects.toThrow(/needs --identity ID or \$COORD_IDENTITY/);
+  });
+});
+
+// ─── runDing — status-file refresh (brief-032) ─────────────────────────
+//
+// Mirrors brief-023's MCP-server refresh tick. Points the fake
+// Coord's `root` at a real /tmp scratch dir so the refresh helper
+// can read/write a real status file; the other fake methods are
+// unchanged.
+
+describe('runDing — status refresh tick', () => {
+  let scratch: string;
+  let coordRoot: string;
+  let identityRoot: string;
+  let statusFile: string;
+  let fake: FakeCoord;
+  let sender: FakeSender;
+  const ID = 'bob';
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), 'coord-ding-srefresh-'));
+    coordRoot = join(scratch, 'coord');
+    mkdirSync(join(coordRoot, ID, 'inbox'), { recursive: true });
+    mkdirSync(join(coordRoot, ID, 'archive'), { recursive: true });
+    identityRoot = join(coordRoot, ID);
+    statusFile = join(identityRoot, 'status');
+    fake = makeFakeCoord(asIdentity(ID), coordRoot);
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  async function readStatus(): Promise<string> {
+    const { readFileSync } = await import('node:fs');
+    return readFileSync(statusFile, 'utf8').trim();
+  }
+
+  it('available status: refresh tick bumps mtime, preserves value', async () => {
+    writeFileSync(statusFile, 'available\n');
+    const oldT = new Date(Date.now() - 10_000);
+    utimesSync(statusFile, oldT, oldT);
+    const mtimeBefore = statSync(statusFile).mtimeMs;
+
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      statusRefreshIntervalMs: 30,
+    });
+    await new Promise((res) => setTimeout(res, 80));
+    expect(await readStatus()).toBe('available');
+    expect(statSync(statusFile).mtimeMs).toBeGreaterThan(mtimeBefore);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('busy status: tick preserves `busy` (user intent honored)', async () => {
+    writeFileSync(statusFile, 'busy\n');
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      statusRefreshIntervalMs: 30,
+    });
+    await new Promise((res) => setTimeout(res, 80));
+    expect(await readStatus()).toBe('busy');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('missing status file: tick writes `available`', async () => {
+    // status file doesn't exist (no writeFileSync above)
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      statusRefreshIntervalMs: 30,
+    });
+    await new Promise((res) => setTimeout(res, 80));
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(statusFile)).toBe(true);
+    expect(await readStatus()).toBe('available');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('corrupt status: tick leaves alone + stderr-warns', async () => {
+    writeFileSync(statusFile, 'garbage-value\n');
+    const log: string[] = [];
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      statusRefreshIntervalMs: 30,
+      stderr: (s) => log.push(s),
+    });
+    await new Promise((res) => setTimeout(res, 80));
+    expect(await readStatus()).toBe('garbage-value');
+    expect(log.join('')).toContain('invalid content');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('literal `unknown` on disk: tick leaves alone, no warning', async () => {
+    writeFileSync(statusFile, 'unknown\n');
+    const log: string[] = [];
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      statusRefreshIntervalMs: 30,
+      stderr: (s) => log.push(s),
+    });
+    await new Promise((res) => setTimeout(res, 80));
+    expect(await readStatus()).toBe('unknown');
+    // `left-unknown` is a deliberate silent no-op, distinct from
+    // `left-corrupt` — should NOT log.
+    expect(log.join('')).not.toContain('invalid content');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('statusRefreshIntervalMs: 0 disables the refresh tick entirely', async () => {
+    writeFileSync(statusFile, 'available\n');
+    const oldT = new Date(Date.now() - 10_000);
+    utimesSync(statusFile, oldT, oldT);
+    const mtimeBefore = statSync(statusFile).mtimeMs;
+
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      statusRefreshIntervalMs: 0,
+    });
+    await new Promise((res) => setTimeout(res, 100));
+    // No refresh happened → mtime unchanged.
+    expect(statSync(statusFile).mtimeMs).toBe(mtimeBefore);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('CLI: --status-refresh-interval-ms requires non-negative integer', async () => {
+    await expect(
+      cmdDingCli(
+        ['session', '--status-refresh-interval-ms', 'abc'],
+        {
+          env: { COORD_IDENTITY: 'bob' } as NodeJS.ProcessEnv,
+          coordRoot: '/tmp',
+          coordConfig: '/tmp',
+          stdout: () => {},
+          stderr: () => {},
+          readStdin: async () => Buffer.alloc(0),
+        }
+      )
+    ).rejects.toThrow(/--status-refresh-interval-ms must be a non-negative integer/);
+  });
+});
+
+// ─── buildPtySendArgs (brief-034) ──────────────────────────────────────
+//
+// Pins the wire shape passed to `spawn('pty', ...)` so a future
+// refactor can't drop `--with-delay 0.5` or rearrange the --seq pairs
+// without the suite catching it. The flag is the load-bearing fix for
+// the brief-034 bug: without it the Enter key races the text payload
+// on bracketed-paste-aware input panes (Codex TUI) and notices land
+// in the prompt without ever submitting as a turn.
+
+describe('buildPtySendArgs', () => {
+  it('inbox-arrival shape: --with-delay 0.5 between session and --seq pairs', () => {
+    const argv = buildPtySendArgs('codex-foo', [
+      'you have a new coord message: hi (from alice); check your inbox',
+      'key:return',
+    ]);
+    expect(argv).toEqual([
+      'send',
+      'codex-foo',
+      '--with-delay',
+      '0.5',
+      '--seq',
+      'you have a new coord message: hi (from alice); check your inbox',
+      '--seq',
+      'key:return',
+    ]);
+  });
+
+  it('tidy-check shape: same --with-delay + key:return tail', () => {
+    const argv = buildPtySendArgs('vauban-codex', [
+      'coord tidy-check: inbox=3 (oldest 47m).',
+      'key:return',
+    ]);
+    expect(argv).toEqual([
+      'send',
+      'vauban-codex',
+      '--with-delay',
+      '0.5',
+      '--seq',
+      'coord tidy-check: inbox=3 (oldest 47m).',
+      '--seq',
+      'key:return',
+    ]);
+  });
+
+  it('argv always ends with --seq key:return (Enter is the last keystroke)', () => {
+    const argv = buildPtySendArgs('s', ['anything', 'key:return']);
+    expect(argv[argv.length - 2]).toBe('--seq');
+    expect(argv[argv.length - 1]).toBe('key:return');
+  });
+
+  it('--with-delay precedes every --seq (so the delay applies between them)', () => {
+    const argv = buildPtySendArgs('s', ['a', 'key:return']);
+    const delayIdx = argv.indexOf('--with-delay');
+    const firstSeqIdx = argv.indexOf('--seq');
+    expect(delayIdx).toBeGreaterThan(-1);
+    expect(firstSeqIdx).toBeGreaterThan(delayIdx);
+  });
+});
+
+// ─── runDing — scan-on-startup (brief-035 t2) ──────────────────────────
+//
+// On boot, ding replays inbox files whose mtime is newer than the
+// watched identity's status mtime through the same onEvent path the
+// watcher uses. Self-healing across restarts: a message that arrived
+// while old-ding was down (or before a binary upgrade) doesn't sit
+// un-pushed.
+
+describe('runDing — scan-on-startup', () => {
+  let scratch: string;
+  let coordRoot: string;
+  let identityRoot: string;
+  let fake: FakeCoord;
+  let sender: FakeSender;
+  const IDENTITY = 'bob';
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), 'coord-ding-scan-'));
+    coordRoot = join(scratch, 'coord');
+    mkdirSync(join(coordRoot, IDENTITY, 'inbox'), { recursive: true });
+    mkdirSync(join(coordRoot, IDENTITY, 'archive'), { recursive: true });
+    identityRoot = join(coordRoot, IDENTITY);
+    fake = makeFakeCoord(asIdentity(IDENTITY), coordRoot);
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  function setStatusMtime(ageMs: number): void {
+    const path = join(identityRoot, 'status');
+    writeFileSync(path, 'available\n');
+    const t = new Date(Date.now() - ageMs);
+    utimesSync(path, t, t);
+  }
+  function plantInboxFile(
+    filename: string,
+    ageMs: number,
+    from = 'alice',
+    subject?: string
+  ): void {
+    const path = join(identityRoot, 'inbox', filename);
+    writeFileSync(
+      path,
+      `---\nfrom: ${from}${subject ? `\nsubject: ${subject}` : ''}\n---\nbody\n`
+    );
+    if (ageMs > 0) {
+      const t = new Date(Date.now() - ageMs);
+      utimesSync(path, t, t);
+    }
+    // The fake's coord.read needs a planted message so buildEvent
+    // can extract `from`/`subject` — wire it up:
+    fake.setMessage(filename, {
+      from,
+      ...(subject !== undefined && { subject }),
+    });
+  }
+
+  it('empty inbox → no startup pushes', async () => {
+    setStatusMtime(60_000);
+    fake.setStatus('available');
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    await settle();
+    expect(sender.calls()).toHaveLength(0);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('one inbox file newer than status mtime → one startup push', async () => {
+    setStatusMtime(60 * 60_000); // status 1h old
+    // file is 10 minutes old, newer than status
+    plantInboxFile('1714826789010-aaaaaa.md', 10 * 60_000, 'alice', 'q');
+    fake.setStatus('available');
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    await settle();
+    expect(sender.calls()).toHaveLength(1);
+    const seqs = sender.calls()[0]!.sequences;
+    expect(seqs[0]).toContain('q');
+    expect(seqs[0]).toContain('alice');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('N inbox files newer than status → N pushes in arrival order', async () => {
+    setStatusMtime(60 * 60_000);
+    // Plant 3 files with ascending unix-ms prefixes. arrival order =
+    // lexicographic order of filename.
+    plantInboxFile('1714826789010-aaaaaa.md', 30 * 60_000, 'alice', 'first');
+    plantInboxFile('1714826789020-bbbbbb.md', 20 * 60_000, 'alice', 'second');
+    plantInboxFile('1714826789030-cccccc.md', 10 * 60_000, 'alice', 'third');
+    fake.setStatus('available');
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    await settle();
+    expect(sender.calls()).toHaveLength(3);
+    expect(sender.calls()[0]!.sequences[0]).toContain('first');
+    expect(sender.calls()[1]!.sequences[0]).toContain('second');
+    expect(sender.calls()[2]!.sequences[0]).toContain('third');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('files OLDER than status mtime → no startup pushes', async () => {
+    // status was set 5 minutes ago; inbox file is 1 hour old (older
+    // than status mtime). The identity-owner already addressed
+    // everything up to status' mtime, so this file is presumed handled.
+    setStatusMtime(5 * 60_000);
+    plantInboxFile('1714826789010-aaaaaa.md', 60 * 60_000);
+    fake.setStatus('available');
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    await settle();
+    expect(sender.calls()).toHaveLength(0);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('missing status file → all inbox files are eligible (treat as 0 baseline)', async () => {
+    // No status file written. mtime defaults to 0; every inbox file
+    // is newer.
+    plantInboxFile('1714826789010-aaaaaa.md', 10 * 60_000, 'alice', 'one');
+    plantInboxFile('1714826789020-bbbbbb.md', 5 * 60_000, 'alice', 'two');
+    fake.setStatus('available');
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    await settle();
+    expect(sender.calls()).toHaveLength(2);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('busy/dnd gating still buffers at startup', async () => {
+    setStatusMtime(60 * 60_000);
+    plantInboxFile('1714826789010-aaaaaa.md', 10 * 60_000, 'alice', 'q');
+    fake.setStatus('busy');
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    await settle();
+    // No deliveries while busy.
+    expect(sender.calls()).toHaveLength(0);
+    // Flip to available — buffered notice flushes.
+    fake.setStatus('available');
+    await new Promise((res) => setTimeout(res, 80));
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('non-grammar files in inbox are skipped (README, malformed names)', async () => {
+    setStatusMtime(60 * 60_000);
+    plantInboxFile('1714826789010-aaaaaa.md', 10 * 60_000);
+    // Plant junk that doesn't match the LAYOUT filename grammar.
+    const noisePath = join(identityRoot, 'inbox', 'README.md');
+    writeFileSync(noisePath, 'docs\n');
+    const noisePath2 = join(identityRoot, 'inbox', 'not-a-message.md');
+    writeFileSync(noisePath2, 'noise\n');
+    fake.setStatus('available');
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    await settle();
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('scan runs before the watcher arms — pre-existing files are processed exactly once', async () => {
+    // The watcher uses sinceNow:true, so pre-existing files would be
+    // missed if we relied on the watcher alone. With scan-on-startup,
+    // a planted-before-boot file is processed once via the scan and
+    // not re-processed by the watcher.
+    setStatusMtime(60 * 60_000);
+    plantInboxFile('1714826789010-aaaaaa.md', 10 * 60_000, 'alice', 'q');
+    fake.setStatus('available');
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    await settle();
+    // Give the watcher a beat to (incorrectly) replay if the scan
+    // accidentally double-counted; expect still 1.
+    await new Promise((res) => setTimeout(res, 80));
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+});
