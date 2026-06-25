@@ -34,6 +34,7 @@ import {
   namePath,
   parseFrontmatter,
   pluralize,
+  prefixOf,
   rand6,
   RESERVED_NAMES,
   resolveIdentity,
@@ -981,5 +982,127 @@ describe('sweep', () => {
 
   it('returns { removed: 0 } when $COORD_ROOT does not exist', () => {
     expect(sweep(join(scratch, 'does-not-exist'))).toEqual({ removed: 0 });
+  });
+
+  // ─── Attachment-family sweep (issue #8) ──────────────────────────────
+  //
+  // When a `.md` AND its prefix-siblings exist in archive byte-identical
+  // to inbox copies (the result of `archive --with-attachments` plus a
+  // round of rsync), sweep must remove the inbox copies of EVERY family
+  // member to keep `rsync` from resurrecting zombies.
+
+  describe('attachment families (issue #8)', () => {
+    it('sibling byte-identical pair + matching archive .md → sibling swept', () => {
+      setupIdentity(coordRootDir, 'bob');
+      const md = '1714826789010-aaaaaa.md';
+      const att = '1714826789010-aaaaaa.options.json';
+      writeFileSync(join(coordRootDir, 'bob', 'inbox', md), 'M');
+      writeFileSync(join(coordRootDir, 'bob', 'archive', md), 'M');
+      writeFileSync(join(coordRootDir, 'bob', 'inbox', att), '{"k":1}');
+      writeFileSync(join(coordRootDir, 'bob', 'archive', att), '{"k":1}');
+      expect(sweep(coordRootDir)).toEqual({ removed: 2 });
+      expect(
+        require('node:fs').existsSync(join(coordRootDir, 'bob', 'inbox', md))
+      ).toBe(false);
+      expect(
+        require('node:fs').existsSync(join(coordRootDir, 'bob', 'inbox', att))
+      ).toBe(false);
+    });
+
+    it('sibling without a matching archive .md → preserved (not coord-owned)', () => {
+      setupIdentity(coordRootDir, 'bob');
+      const att = '1714826789010-aaaaaa.options.json';
+      writeFileSync(join(coordRootDir, 'bob', 'inbox', att), 'X');
+      writeFileSync(join(coordRootDir, 'bob', 'archive', att), 'X');
+      // No matching archive/.md; sweep must not touch this — it's
+      // indistinguishable from a random file the user happened to put
+      // in both folders.
+      expect(sweep(coordRootDir)).toEqual({ removed: 0 });
+      expect(
+        require('node:fs').existsSync(join(coordRootDir, 'bob', 'inbox', att))
+      ).toBe(true);
+    });
+
+    it('divergent sibling pair → preserved (no data loss)', () => {
+      setupIdentity(coordRootDir, 'bob');
+      const md = '1714826789010-aaaaaa.md';
+      const att = '1714826789010-aaaaaa.options.json';
+      writeFileSync(join(coordRootDir, 'bob', 'inbox', md), 'M');
+      writeFileSync(join(coordRootDir, 'bob', 'archive', md), 'M');
+      writeFileSync(join(coordRootDir, 'bob', 'inbox', att), 'inbox');
+      writeFileSync(join(coordRootDir, 'bob', 'archive', att), 'archive');
+      // The .md still gets swept; the divergent sibling does NOT.
+      expect(sweep(coordRootDir)).toEqual({ removed: 1 });
+      expect(
+        require('node:fs').existsSync(join(coordRootDir, 'bob', 'inbox', att))
+      ).toBe(true);
+    });
+
+    it('random file (no LAYOUT prefix) is always ignored', () => {
+      setupIdentity(coordRootDir, 'bob');
+      writeFileSync(join(coordRootDir, 'bob', 'inbox', '.DS_Store'), 'x');
+      writeFileSync(join(coordRootDir, 'bob', 'archive', '.DS_Store'), 'x');
+      expect(sweep(coordRootDir)).toEqual({ removed: 0 });
+      expect(
+        require('node:fs').existsSync(
+          join(coordRootDir, 'bob', 'inbox', '.DS_Store')
+        )
+      ).toBe(true);
+    });
+
+    it('multiple siblings of one .md → all swept', () => {
+      setupIdentity(coordRootDir, 'bob');
+      const md = '1714826789010-aaaaaa.md';
+      const att1 = '1714826789010-aaaaaa.options.json';
+      const att2 = '1714826789010-aaaaaa.schema.json';
+      for (const f of [md, att1, att2]) {
+        writeFileSync(join(coordRootDir, 'bob', 'inbox', f), f);
+        writeFileSync(join(coordRootDir, 'bob', 'archive', f), f);
+      }
+      expect(sweep(coordRootDir)).toEqual({ removed: 3 });
+    });
+  });
+});
+
+// ─── prefixOf ──────────────────────────────────────────────────────────
+
+describe('prefixOf', () => {
+  it('extracts the 20-char prefix from a canonical .md', () => {
+    expect(prefixOf('1714826789010-aaaaaa.md')).toBe('1714826789010-aaaaaa');
+  });
+
+  it('extracts the prefix from a sibling attachment', () => {
+    expect(prefixOf('1714826789010-aaaaaa.options.json')).toBe(
+      '1714826789010-aaaaaa'
+    );
+    expect(prefixOf('1714826789010-aaaaaa.schema.json')).toBe(
+      '1714826789010-aaaaaa'
+    );
+  });
+
+  it('returns null when the prefix grammar does not match', () => {
+    expect(prefixOf('readme.md')).toBeNull();
+    expect(prefixOf('.DS_Store')).toBeNull();
+    expect(prefixOf('shortprefix.md')).toBeNull();
+  });
+
+  it('returns null when there is no extension at all', () => {
+    // Bare prefix isn't a coord file — coord names always carry an
+    // extension (`.md` or the attachment suffix).
+    expect(prefixOf('1714826789010-aaaaaa')).toBeNull();
+  });
+
+  it('matches validFilename grammar exactly (12-digit ts → reject)', () => {
+    expect(prefixOf('171482678901-aaaaaa.options.json')).toBeNull(); // 12 digits
+    expect(prefixOf('17148267890100-aaaaaa.options.json')).toBeNull(); // 14 digits
+  });
+
+  it('matches validFilename: liberal rand6 (i/l/o/u permitted)', () => {
+    // We intentionally mirror validFilename's `[0-9a-z]{6}` rather than
+    // the strict Crockford alphabet, so a `.md` and its siblings stay
+    // associated even on names that drift from the canonical alphabet.
+    expect(prefixOf('1714826789010-iiiiii.options.json')).toBe(
+      '1714826789010-iiiiii'
+    );
   });
 });

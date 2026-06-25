@@ -63,10 +63,11 @@ const MESSAGE_USAGE =
   `usage: coord message <verb> [args...]   (alias: coord msg <verb>)\n\n` +
   `  send <to> [--from ID] [--subject S] [--in-reply-to F] [--tags T,T] [--priority P]\n` +
   `                                   read body from stdin\n` +
-  `  ls [<identity>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID]\n` +
+  `  ls [<identity>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID] [--orphans]\n` +
   `  read [<identity>] <filename> [--raw|--json] [--archive]\n` +
-  `  archive [<identity>] <filename>\n` +
+  `  archive [<identity>] <filename> [--with-attachments]\n` +
   `  archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run]\n` +
+  `                                   [--with-attachments]\n` +
   `  thread [<identity>] <filename> [--tree]\n`;
 
 const TOP_LEVEL_USAGE =

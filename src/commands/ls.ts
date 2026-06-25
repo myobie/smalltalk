@@ -9,6 +9,7 @@ import {
   inboxDir,
   parseFrontmatter,
   pluralize,
+  prefixOf,
   resolveIdentity,
   validFilename,
 } from '../common.ts';
@@ -26,6 +27,14 @@ export interface LsInput {
    * path that `coord ls` and `coord watch` rely on.
    */
   withMeta?: boolean;
+  /**
+   * Issue #8: when true, list prefix-sibling attachments in the folder
+   * whose `<unix-ms>-<rand6>` prefix has no matching `.md` in the same
+   * folder. These are orphans — left behind when a `.md` is archived
+   * without `--with-attachments`. Incompatible with {@link withMeta} and
+   * {@link fromFilter} (no frontmatter to project / filter on).
+   */
+  orphans?: boolean;
 
   env: NodeJS.ProcessEnv;
   coordRoot: string;
@@ -125,6 +134,7 @@ export function cmdLs(input: LsInput): LsResult {
   const since = input.since;
   const fromFilter = input.fromFilter;
   const withMeta = input.withMeta === true;
+  const orphansMode = input.orphans === true;
 
   let names: string[];
   try {
@@ -134,12 +144,41 @@ export function cmdLs(input: LsInput): LsResult {
     // gracefully per the brief-016 read-side resilience contract.
     const empty: LsResult = {
       matches: [],
-      header: `# 0 messages in ${label}`,
+      header: orphansMode
+        ? `# 0 orphan attachments in ${label}`
+        : `# 0 messages in ${label}`,
       archive,
     };
-    if (input.withMeta === true) empty.items = [];
+    if (withMeta) empty.items = [];
     return empty;
   }
+
+  if (orphansMode) {
+    // Build the set of canonical .md prefixes present in this folder;
+    // a prefix-sibling whose prefix is NOT in this set is an orphan.
+    const mdPrefixes = new Set<string>();
+    for (const name of names) {
+      if (validFilename(name)) mdPrefixes.add(name.slice(0, 20));
+    }
+    const orphans: string[] = [];
+    for (const name of names.sort()) {
+      if (validFilename(name)) continue; // it's a real .md, not an orphan
+      const pre = prefixOf(name);
+      if (pre === null) continue; // random file, not a coord sibling
+      if (mdPrefixes.has(pre)) continue; // has a matching .md; not orphaned
+      if (since !== undefined) {
+        // The 13-digit prefix segment IS the unix-ms timestamp; reuse it
+        // rather than calling filenameTimestamp (which validates .md grammar).
+        if (Number(pre.slice(0, 13)) < since) continue;
+      }
+      orphans.push(name);
+    }
+    const n = orphans.length;
+    const word = pluralize(n, 'attachment', 'attachments');
+    const header = `# ${n} orphan ${word} in ${label}`;
+    return { matches: orphans, header, archive };
+  }
+
   const matches: string[] = [];
   const items: LsItem[] = [];
   for (const name of names.sort()) {
@@ -177,6 +216,7 @@ export function cmdLsCli(args: readonly string[], ctx: CliContext): number {
   let archive = false;
   let count = false;
   let json = false;
+  let orphans = false;
   let since: number | undefined;
   let fromFilter: string | undefined;
   for (let i = 0; i < args.length; i++) {
@@ -190,6 +230,9 @@ export function cmdLsCli(args: readonly string[], ctx: CliContext): number {
         break;
       case '--json':
         json = true;
+        break;
+      case '--orphans':
+        orphans = true;
         break;
       case '--since': {
         const v = args[++i];
@@ -205,7 +248,7 @@ export function cmdLsCli(args: readonly string[], ctx: CliContext): number {
       case '-h':
       case '--help':
         ctx.stderr(
-          'usage: coord message ls [<recipient>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID]\n'
+          'usage: coord message ls [<recipient>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID] [--orphans]\n'
         );
         return 0;
       default:
@@ -217,12 +260,18 @@ export function cmdLsCli(args: readonly string[], ctx: CliContext): number {
   if (count && json) {
     throw new Error('--count and --json are mutually exclusive');
   }
+  if (orphans && fromFilter !== undefined) {
+    throw new Error('--orphans and --from are mutually exclusive (orphans have no frontmatter)');
+  }
   const r = cmdLs({
     ...(recipient !== undefined && { recipient }),
     archive,
     ...(since !== undefined && { since }),
     ...(fromFilter !== undefined && { fromFilter }),
-    withMeta: json,
+    // --orphans skips message-parsing entirely; --json on orphans emits a
+    // filename-only list (see below), so withMeta stays off in that case.
+    withMeta: json && !orphans,
+    orphans,
     env: ctx.env,
     coordRoot: ctx.coordRoot,
   });
@@ -231,6 +280,16 @@ export function cmdLsCli(args: readonly string[], ctx: CliContext): number {
     return 0;
   }
   if (json) {
+    if (orphans) {
+      // Richer shape than bare filenames: include the derived ts so
+      // consumers can age-sort without re-parsing the prefix.
+      const items = r.matches.map((filename) => ({
+        filename,
+        ts: Number(filename.slice(0, 13)),
+      }));
+      ctx.stdout(`${JSON.stringify(items)}\n`);
+      return 0;
+    }
     ctx.stdout(`${JSON.stringify(r.items ?? [])}\n`);
     return 0;
   }

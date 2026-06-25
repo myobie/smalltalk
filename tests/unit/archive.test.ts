@@ -455,3 +455,158 @@ describe('cmdArchiveTrim — non-grammar files in archive/', () => {
     ).toBe(true);
   });
 });
+
+// ─── --with-attachments (issue #8) ─────────────────────────────────────────
+
+function writeAttachment(
+  id: string,
+  filename: string,
+  body: string,
+  folder: 'inbox' | 'archive' = 'inbox'
+): void {
+  writeFileSync(join(coordRoot, id, folder, filename), body);
+}
+
+describe('cmdArchive — --with-attachments', () => {
+  const MD = '1714826789010-aaaaaa.md';
+  const ATT1 = '1714826789010-aaaaaa.options.json';
+  const ATT2 = '1714826789010-aaaaaa.schema.json';
+
+  it('moves the .md AND prefix-siblings to archive', () => {
+    setupIdentity('bob');
+    writeMsg('bob', MD);
+    writeAttachment('bob', ATT1, '{"k":1}');
+    writeAttachment('bob', ATT2, '{"type":"object"}');
+    const r = cmdArchive(archiveInput({ withAttachments: true }));
+    expect(r.outcome.kind).toBe('moved');
+    expect(r.attachments).toHaveLength(2);
+    expect(r.attachments!.map((a) => a.filename).sort()).toEqual([
+      ATT1,
+      ATT2,
+    ]);
+    for (const f of [MD, ATT1, ATT2]) {
+      expect(existsSync(join(coordRoot, 'bob', 'inbox', f))).toBe(false);
+      expect(existsSync(join(coordRoot, 'bob', 'archive', f))).toBe(true);
+    }
+  });
+
+  it('without --with-attachments siblings stay behind (regression: pre-#8 default)', () => {
+    setupIdentity('bob');
+    writeMsg('bob', MD);
+    writeAttachment('bob', ATT1, 'x');
+    const r = cmdArchive(archiveInput());
+    expect(r.attachments).toBeUndefined();
+    expect(existsSync(join(coordRoot, 'bob', 'archive', MD))).toBe(true);
+    expect(existsSync(join(coordRoot, 'bob', 'inbox', ATT1))).toBe(true);
+    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT1))).toBe(false);
+  });
+
+  it('empty attachment array when no siblings exist', () => {
+    setupIdentity('bob');
+    writeMsg('bob', MD);
+    const r = cmdArchive(archiveInput({ withAttachments: true }));
+    expect(r.attachments).toEqual([]);
+  });
+
+  it('pre-flight refuses on divergent sibling twin (atomic)', () => {
+    setupIdentity('bob');
+    writeMsg('bob', MD);
+    writeAttachment('bob', ATT1, 'inbox-version');
+    writeAttachment('bob', ATT1, 'archive-version', 'archive');
+    // .md is fine but the sibling has a divergent twin → whole op refuses.
+    expect(() =>
+      cmdArchive(archiveInput({ withAttachments: true }))
+    ).toThrowError(/refuse to archive/);
+    // Nothing moved: the .md is still in inbox.
+    expect(existsSync(join(coordRoot, 'bob', 'inbox', MD))).toBe(true);
+    expect(existsSync(join(coordRoot, 'bob', 'archive', MD))).toBe(false);
+  });
+
+  it('idempotent on byte-identical siblings already in archive', () => {
+    setupIdentity('bob');
+    // .md AND sibling already archived; bare archive has been
+    // re-run after a sync. Should report idempotent for both.
+    writeMsg('bob', MD);
+    writeMsg('bob', MD, 'body', 'archive'); // identical content
+    writeAttachment('bob', ATT1, 'same');
+    writeAttachment('bob', ATT1, 'same', 'archive');
+    const r = cmdArchive(archiveInput({ withAttachments: true }));
+    expect(r.outcome.kind).toBe('idempotent');
+    expect(r.attachments).toHaveLength(1);
+    expect(r.attachments![0]!.outcome.kind).toBe('idempotent');
+    // Inbox copies cleared.
+    expect(existsSync(join(coordRoot, 'bob', 'inbox', MD))).toBe(false);
+    expect(existsSync(join(coordRoot, 'bob', 'inbox', ATT1))).toBe(false);
+  });
+
+  it('sibling that exists only in archive (post-sync) is handled idempotently', () => {
+    setupIdentity('bob');
+    writeMsg('bob', MD);
+    writeAttachment('bob', ATT1, 'x', 'archive'); // archive-only
+    const r = cmdArchive(archiveInput({ withAttachments: true }));
+    expect(r.outcome.kind).toBe('moved');
+    expect(r.attachments).toHaveLength(1);
+    expect(r.attachments![0]!.outcome.kind).toBe('idempotent');
+  });
+
+  it('does not touch random files (no prefix match)', () => {
+    setupIdentity('bob');
+    writeMsg('bob', MD);
+    writeAttachment('bob', '.DS_Store', 'junk');
+    writeAttachment('bob', 'README', 'junk');
+    const r = cmdArchive(archiveInput({ withAttachments: true }));
+    expect(r.attachments).toEqual([]);
+    expect(existsSync(join(coordRoot, 'bob', 'inbox', '.DS_Store'))).toBe(true);
+    expect(existsSync(join(coordRoot, 'bob', 'inbox', 'README'))).toBe(true);
+  });
+});
+
+describe('cmdArchiveTrim — --with-attachments', () => {
+  const MD1 = '1714826789010-aaaaaa.md';
+  const ATT1A = '1714826789010-aaaaaa.options.json';
+  const ATT1B = '1714826789010-aaaaaa.schema.json';
+  const MD2 = '1714826790000-bbbbbb.md';
+  const ATT2 = '1714826790000-bbbbbb.options.json';
+
+  it('deletes siblings of trimmed .md alongside the .md', () => {
+    setupIdentity('bob');
+    writeMsg('bob', MD1, 'old', 'archive');
+    writeMsg('bob', MD2, 'new', 'archive');
+    writeAttachment('bob', ATT1A, 'a', 'archive');
+    writeAttachment('bob', ATT1B, 'b', 'archive');
+    writeAttachment('bob', ATT2, 'c', 'archive');
+    const r = cmdArchiveTrim(
+      trimInput({ keepLast: 1, withAttachments: true })
+    );
+    expect(r.victims).toEqual([MD1]); // older one trimmed
+    expect(r.attachments).toEqual([ATT1A, ATT1B]); // its siblings
+    expect(existsSync(join(coordRoot, 'bob', 'archive', MD1))).toBe(false);
+    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT1A))).toBe(false);
+    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT1B))).toBe(false);
+    // MD2's sibling preserved.
+    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT2))).toBe(true);
+  });
+
+  it('without --with-attachments leaves siblings (regression)', () => {
+    setupIdentity('bob');
+    writeMsg('bob', MD1, 'old', 'archive');
+    writeAttachment('bob', ATT1A, 'a', 'archive');
+    const r = cmdArchiveTrim(trimInput({ keepLast: 0 }));
+    expect(r.victims).toEqual([MD1]);
+    expect(r.attachments).toBeUndefined();
+    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT1A))).toBe(true);
+  });
+
+  it('--dry-run + --with-attachments lists siblings without deleting', () => {
+    setupIdentity('bob');
+    writeMsg('bob', MD1, 'old', 'archive');
+    writeAttachment('bob', ATT1A, 'a', 'archive');
+    const r = cmdArchiveTrim(
+      trimInput({ keepLast: 0, withAttachments: true, dryRun: true })
+    );
+    expect(r.victims).toEqual([MD1]);
+    expect(r.attachments).toEqual([ATT1A]);
+    expect(existsSync(join(coordRoot, 'bob', 'archive', MD1))).toBe(true);
+    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT1A))).toBe(true);
+  });
+});

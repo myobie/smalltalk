@@ -441,3 +441,175 @@ describe('cmdLsCli — --json output', () => {
     ).toThrowError(/--count and --json are mutually exclusive/);
   });
 });
+
+// ─── --orphans (issue #8) ──────────────────────────────────────────────────
+
+function writeAttachment(
+  id: string,
+  filename: string,
+  body: string,
+  folder: 'inbox' | 'archive' = 'inbox'
+): void {
+  writeFileSync(join(coordRoot, id, folder, filename), body);
+}
+
+describe('cmdLs — --orphans', () => {
+  it('inbox sibling with no matching .md → reported as orphan', () => {
+    setupIdentity('bob');
+    writeAttachment(
+      'bob',
+      '1714826789010-aaaaaa.options.json',
+      '{"k":1}'
+    );
+    const r = cmdLs(baseInput({ orphans: true }));
+    expect(r.matches).toEqual(['1714826789010-aaaaaa.options.json']);
+    expect(r.header).toContain('1 orphan attachment');
+  });
+
+  it('sibling WITH matching .md → not an orphan', () => {
+    setupIdentity('bob');
+    writeMsg('bob', '1714826789010-aaaaaa.md', 'alice');
+    writeAttachment(
+      'bob',
+      '1714826789010-aaaaaa.options.json',
+      '{"k":1}'
+    );
+    const r = cmdLs(baseInput({ orphans: true }));
+    expect(r.matches).toEqual([]);
+    expect(r.header).toContain('0 orphan attachments');
+  });
+
+  it('.md files themselves are never orphans', () => {
+    setupIdentity('bob');
+    writeMsg('bob', '1714826789010-aaaaaa.md', 'alice');
+    const r = cmdLs(baseInput({ orphans: true }));
+    expect(r.matches).toEqual([]);
+  });
+
+  it('random files (no LAYOUT prefix) are ignored, not reported', () => {
+    setupIdentity('bob');
+    writeAttachment('bob', 'README', 'x');
+    writeAttachment('bob', '.DS_Store', 'x');
+    const r = cmdLs(baseInput({ orphans: true }));
+    expect(r.matches).toEqual([]);
+  });
+
+  it('mixed: archived .md + orphan siblings remaining in inbox', () => {
+    setupIdentity('bob');
+    // .md was archived without --with-attachments, leaving two
+    // orphans behind in inbox. This is the issue's exact scenario.
+    writeMsg('bob', '1714826789010-aaaaaa.md', 'alice', 'body', 'archive');
+    writeAttachment(
+      'bob',
+      '1714826789010-aaaaaa.options.json',
+      '{"k":1}'
+    );
+    writeAttachment(
+      'bob',
+      '1714826789010-aaaaaa.schema.json',
+      '{}'
+    );
+    const r = cmdLs(baseInput({ orphans: true }));
+    expect(r.matches).toEqual([
+      '1714826789010-aaaaaa.options.json',
+      '1714826789010-aaaaaa.schema.json',
+    ]);
+    expect(r.header).toContain('2 orphan attachments');
+  });
+
+  it('--archive scopes orphan scan to archive/', () => {
+    setupIdentity('bob');
+    // Orphan only in archive (someone manually moved a sibling but
+    // not the .md — unusual, but the detector covers it).
+    writeAttachment(
+      'bob',
+      '1714826789010-aaaaaa.options.json',
+      '{}',
+      'archive'
+    );
+    const r = cmdLs(baseInput({ orphans: true, archive: true }));
+    expect(r.matches).toEqual(['1714826789010-aaaaaa.options.json']);
+  });
+
+  it('--since filters by the prefix ts', () => {
+    setupIdentity('bob');
+    writeAttachment(
+      'bob',
+      '1714826789010-aaaaaa.options.json',
+      'old'
+    );
+    writeAttachment(
+      'bob',
+      '1714826790000-bbbbbb.options.json',
+      'new'
+    );
+    const r = cmdLs(baseInput({ orphans: true, since: 1714826789500 }));
+    expect(r.matches).toEqual(['1714826790000-bbbbbb.options.json']);
+  });
+
+  it('CLI: --orphans + --json emits [{filename, ts}, ...]', async () => {
+    const { cmdLsCli } = await import('../../src/commands/ls.ts');
+    setupIdentity('bob');
+    writeAttachment(
+      'bob',
+      '1714826789010-aaaaaa.options.json',
+      '{}'
+    );
+    let stdout = '';
+    cmdLsCli(['bob', '--orphans', '--json'], {
+      env: {} as NodeJS.ProcessEnv,
+      coordRoot,
+      coordConfig: '',
+      stdout: (s) => {
+        stdout += s;
+      },
+      stderr: () => {},
+      readStdin: async () => Buffer.from(''),
+    });
+    expect(JSON.parse(stdout)).toEqual([
+      { filename: '1714826789010-aaaaaa.options.json', ts: 1714826789010 },
+    ]);
+  });
+
+  it('CLI: --orphans + --from is rejected', async () => {
+    const { cmdLsCli } = await import('../../src/commands/ls.ts');
+    setupIdentity('bob');
+    expect(() =>
+      cmdLsCli(['bob', '--orphans', '--from', 'alice'], {
+        env: {} as NodeJS.ProcessEnv,
+        coordRoot,
+        coordConfig: '',
+        stdout: () => {},
+        stderr: () => {},
+        readStdin: async () => Buffer.from(''),
+      })
+    ).toThrowError(/--orphans and --from/);
+  });
+
+  it('CLI: --orphans --count just prints the count', async () => {
+    const { cmdLsCli } = await import('../../src/commands/ls.ts');
+    setupIdentity('bob');
+    writeAttachment(
+      'bob',
+      '1714826789010-aaaaaa.options.json',
+      'x'
+    );
+    writeAttachment(
+      'bob',
+      '1714826789020-bbbbbb.schema.json',
+      'y'
+    );
+    let stdout = '';
+    cmdLsCli(['bob', '--orphans', '--count'], {
+      env: {} as NodeJS.ProcessEnv,
+      coordRoot,
+      coordConfig: '',
+      stdout: (s) => {
+        stdout += s;
+      },
+      stderr: () => {},
+      readStdin: async () => Buffer.from(''),
+    });
+    expect(stdout.trim()).toBe('2');
+  });
+});

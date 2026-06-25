@@ -10,6 +10,7 @@ import {
   inboxDir,
   msNow,
   pluralize,
+  prefixOf,
   resolveIdentity,
   validFilename,
 } from '../common.ts';
@@ -25,6 +26,14 @@ import {
 export interface ArchiveInput {
   recipient?: string | undefined;
   filename: string;
+  /**
+   * Issue #8: when true, also move prefix-sibling attachments — every
+   * file in inbox/ whose `<unix-ms>-<rand6>` prefix matches the canonical
+   * `.md`. Default false preserves the LAYOUT-004 "coord owns only the
+   * .md" semantic; opt-in keeps attachments lifecycle-coupled when the
+   * caller wants that.
+   */
+  withAttachments?: boolean;
   env: NodeJS.ProcessEnv;
   coordRoot: string;
 }
@@ -36,9 +45,21 @@ export type ArchiveOutcome =
       message: 'archived (idempotent: archive copy already present)';
     };
 
+/** One archived attachment sibling — paired with its outcome. */
+export interface ArchivedAttachment {
+  filename: string;
+  outcome: ArchiveOutcome;
+}
+
 export interface ArchiveResult {
   outcome: ArchiveOutcome;
   recipient: string;
+  /**
+   * When {@link ArchiveInput.withAttachments} was true, the per-sibling
+   * outcomes (excluding the canonical `.md`). Empty when no siblings
+   * existed. Undefined when withAttachments was false.
+   */
+  attachments?: ArchivedAttachment[];
 }
 
 export function cmdArchive(input: ArchiveInput): ArchiveResult {
@@ -53,49 +74,118 @@ export function cmdArchive(input: ArchiveInput): ArchiveResult {
     throw new InvalidFilenameError(input.filename);
   }
 
-  const ipath = join(inboxDir(recipient, input.coordRoot), input.filename);
-  const apath = join(archiveDir(recipient, input.coordRoot), input.filename);
+  const inbox = inboxDir(recipient, input.coordRoot);
+  const archive = archiveDir(recipient, input.coordRoot);
+  const ipath = join(inbox, input.filename);
+  const apath = join(archive, input.filename);
+  const withAttachments = input.withAttachments === true;
 
-  // Case 0 (post-sweep idempotent): inbox empty, archive present.
-  if (!existsSync(ipath) && existsSync(apath)) {
-    return idempotentResult(recipient);
-  }
-
-  // Case 1: not in either folder.
-  if (!existsSync(ipath)) {
-    throw new MessageNotFoundError(recipient, input.filename);
-  }
-
-  ensureIdentityDirs(recipient, input.coordRoot);
-
-  if (existsSync(apath)) {
-    // Case 2 or 3: archive copy exists. Compare byte-by-byte.
-    const ibuf = readFileSync(ipath);
-    const abuf = readFileSync(apath);
-    if (ibuf.equals(abuf)) {
-      // Case 2: byte-identical — remove inbox dup as a no-op.
-      rmSync(ipath);
-      return idempotentResult(recipient);
+  // ─── Discover attachment siblings (issue #8) ────────────────────────
+  // Find every file in inbox/ AND archive/ that shares the canonical
+  // prefix (excluding the `.md` itself). We must look at archive too:
+  // post-sync, a sibling may exist only in archive (peer already moved
+  // it), or in both (matching the `.md` byte-identical case).
+  const prefix = input.filename.slice(0, 20);
+  const siblings: string[] = [];
+  if (withAttachments) {
+    const seen = new Set<string>();
+    for (const dir of [inbox, archive]) {
+      let entries: string[];
+      try {
+        entries = readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const name of entries) {
+        if (name === input.filename) continue;
+        if (prefixOf(name) !== prefix) continue;
+        if (seen.has(name)) continue;
+        seen.add(name);
+        siblings.push(name);
+      }
     }
-    // Case 3: differs. Refuse.
-    throw new ArchiveConflictError(recipient, input.filename);
+    siblings.sort();
   }
 
-  // Case 4: clean rename.
-  renameSync(ipath, apath);
-  return {
-    outcome: { kind: 'moved', message: 'archived' },
-    recipient,
-  };
+  // ─── Pre-flight conflict check ──────────────────────────────────────
+  // Atomic semantics: if ANY family member would conflict (divergent
+  // archive twin), refuse the whole operation rather than half-moving.
+  // The `.md` itself is checked first; siblings only matter when
+  // withAttachments is on.
+  const familyCheck: { filename: string; ipath: string; apath: string }[] = [
+    { filename: input.filename, ipath, apath },
+  ];
+  for (const s of siblings) {
+    familyCheck.push({
+      filename: s,
+      ipath: join(inbox, s),
+      apath: join(archive, s),
+    });
+  }
+  for (const fam of familyCheck) {
+    if (existsSync(fam.ipath) && existsSync(fam.apath)) {
+      const ibuf = readFileSync(fam.ipath);
+      const abuf = readFileSync(fam.apath);
+      if (!ibuf.equals(abuf)) {
+        throw new ArchiveConflictError(recipient, fam.filename);
+      }
+    }
+  }
+
+  // ─── Canonical .md outcome ──────────────────────────────────────────
+  let canonical: ArchiveOutcome;
+  if (!existsSync(ipath) && existsSync(apath)) {
+    // Case 0 (post-sweep idempotent).
+    canonical = idempotentOutcome();
+  } else if (!existsSync(ipath)) {
+    // Case 1: not in either folder.
+    throw new MessageNotFoundError(recipient, input.filename);
+  } else {
+    ensureIdentityDirs(recipient, input.coordRoot);
+    if (existsSync(apath)) {
+      // Case 2 — byte-identical already validated upstream.
+      rmSync(ipath);
+      canonical = idempotentOutcome();
+    } else {
+      // Case 4: clean rename.
+      renameSync(ipath, apath);
+      canonical = { kind: 'moved', message: 'archived' };
+    }
+  }
+
+  if (!withAttachments) {
+    return { outcome: canonical, recipient };
+  }
+
+  // ─── Sibling outcomes ───────────────────────────────────────────────
+  const attachmentOutcomes: ArchivedAttachment[] = [];
+  for (const s of siblings) {
+    const sip = join(inbox, s);
+    const sap = join(archive, s);
+    let outcome: ArchiveOutcome;
+    if (!existsSync(sip) && existsSync(sap)) {
+      outcome = idempotentOutcome();
+    } else if (!existsSync(sip)) {
+      // Should be unreachable: discovery added this entry because it
+      // existed in inbox OR archive; if neither exists now, skip it.
+      continue;
+    } else if (existsSync(sap)) {
+      // Byte-identical already validated upstream.
+      rmSync(sip);
+      outcome = idempotentOutcome();
+    } else {
+      renameSync(sip, sap);
+      outcome = { kind: 'moved', message: 'archived' };
+    }
+    attachmentOutcomes.push({ filename: s, outcome });
+  }
+  return { outcome: canonical, recipient, attachments: attachmentOutcomes };
 }
 
-function idempotentResult(recipient: string): ArchiveResult {
+function idempotentOutcome(): ArchiveOutcome {
   return {
-    outcome: {
-      kind: 'idempotent',
-      message: 'archived (idempotent: archive copy already present)',
-    },
-    recipient,
+    kind: 'idempotent',
+    message: 'archived (idempotent: archive copy already present)',
   };
 }
 
@@ -137,6 +227,13 @@ export interface ArchiveTrimInput {
   keepLast?: number | undefined;
   /** When true, list victims but delete nothing. */
   dryRun?: boolean;
+  /**
+   * Issue #8: when true, also delete prefix-sibling attachments of each
+   * trimmed `.md` — symmetric with `coord message archive
+   * --with-attachments`. Default false matches the LAYOUT-004 "coord
+   * owns only the .md" semantic.
+   */
+  withAttachments?: boolean;
 
   env: NodeJS.ProcessEnv;
   coordRoot: string;
@@ -151,6 +248,13 @@ export interface ArchiveTrimResult {
   summary: string;
   /** Whether this was a dry run. */
   dryRun: boolean;
+  /**
+   * When {@link ArchiveTrimInput.withAttachments} was true, the
+   * sibling files deleted (or that *would* be deleted under --dry-run)
+   * alongside the canonical `.md` victims. Empty when no siblings
+   * existed in archive. Undefined when withAttachments was false.
+   */
+  attachments?: string[];
 }
 
 export function cmdArchiveTrim(input: ArchiveTrimInput): ArchiveTrimResult {
@@ -215,12 +319,39 @@ export function cmdArchiveTrim(input: ArchiveTrimInput): ArchiveTrimResult {
   // Stable order: chronological (= filename ascending).
   const uniq = files.filter((f) => victims.has(f));
 
+  // Issue #8: when --with-attachments, also collect prefix-siblings of
+  // each victim from the same archive folder. Scanned from the full
+  // directory listing rather than the grammar-filtered `files` since
+  // siblings deliberately don't match the .md grammar.
+  let attachments: string[] | undefined;
+  if (input.withAttachments === true) {
+    const victimPrefixes = new Set<string>();
+    for (const v of uniq) victimPrefixes.add(v.slice(0, 20));
+    const siblingSet = new Set<string>();
+    for (const name of entries) {
+      if (validFilename(name)) continue; // .md handled by the main loop
+      const pre = prefixOf(name);
+      if (pre === null) continue;
+      if (victimPrefixes.has(pre)) siblingSet.add(name);
+    }
+    attachments = [...siblingSet].sort();
+  }
+
   if (!dryRun) {
     for (const f of uniq) {
       try {
         rmSync(join(adir, f));
       } catch {
         // ignore: best-effort
+      }
+    }
+    if (attachments !== undefined) {
+      for (const f of attachments) {
+        try {
+          rmSync(join(adir, f));
+        } catch {
+          // ignore: best-effort
+        }
       }
     }
   }
@@ -230,7 +361,9 @@ export function cmdArchiveTrim(input: ArchiveTrimInput): ArchiveTrimResult {
     ? `# would trim ${uniq.length} ${word} (dry run; nothing deleted)`
     : `# trimmed ${uniq.length} ${word}`;
 
-  return { victims: uniq, summary, dryRun };
+  const result: ArchiveTrimResult = { victims: uniq, summary, dryRun };
+  if (attachments !== undefined) result.attachments = attachments;
+  return result;
 }
 
 const DURATION_RE = /^([0-9]+)([smhdw])$/;
@@ -255,15 +388,19 @@ export function cmdArchiveCli(
   if (args[0] === 'trim') {
     return cmdArchiveTrimCli(args.slice(1), ctx);
   }
+  let withAttachments = false;
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     switch (a) {
+      case '--with-attachments':
+        withAttachments = true;
+        break;
       case '-h':
       case '--help':
         ctx.stderr(
-          'usage: coord message archive [<identity>] <filename>\n' +
-            '       coord message archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run]\n'
+          'usage: coord message archive [<identity>] <filename> [--with-attachments]\n' +
+            '       coord message archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run] [--with-attachments]\n'
         );
         return 0;
       default:
@@ -276,10 +413,18 @@ export function cmdArchiveCli(
   const r = cmdArchive({
     ...(recipient !== undefined && { recipient }),
     filename,
+    withAttachments,
     env: ctx.env,
     coordRoot: ctx.coordRoot,
   });
   ctx.stderr(`${r.outcome.message}\n`);
+  if (r.attachments !== undefined && r.attachments.length > 0) {
+    const word = pluralize(r.attachments.length, 'attachment', 'attachments');
+    ctx.stderr(`# also archived ${r.attachments.length} ${word}\n`);
+    for (const att of r.attachments) {
+      ctx.stderr(`  ${att.filename}: ${att.outcome.message}\n`);
+    }
+  }
   return 0;
 }
 
@@ -288,6 +433,7 @@ function cmdArchiveTrimCli(args: readonly string[], ctx: CliContext): number {
   let olderThan: string | undefined;
   let keepLast: number | undefined;
   let dryRun = false;
+  let withAttachments = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     switch (a) {
@@ -305,10 +451,13 @@ function cmdArchiveTrimCli(args: readonly string[], ctx: CliContext): number {
       case '--dry-run':
         dryRun = true;
         break;
+      case '--with-attachments':
+        withAttachments = true;
+        break;
       case '-h':
       case '--help':
         ctx.stderr(
-          'usage: coord message archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run]\n'
+          'usage: coord message archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run] [--with-attachments]\n'
         );
         return 0;
       default:
@@ -322,11 +471,20 @@ function cmdArchiveTrimCli(args: readonly string[], ctx: CliContext): number {
     ...(olderThan !== undefined && { olderThan }),
     ...(keepLast !== undefined && { keepLast }),
     dryRun,
+    withAttachments,
     env: ctx.env,
     coordRoot: ctx.coordRoot,
   });
   for (const f of r.victims) ctx.stdout(`${f}\n`);
+  if (r.attachments !== undefined) {
+    for (const a of r.attachments) ctx.stdout(`${a}\n`);
+  }
   ctx.stderr(`${r.summary}\n`);
+  if (r.attachments !== undefined && r.attachments.length > 0) {
+    const word = pluralize(r.attachments.length, 'attachment', 'attachments');
+    const verb = dryRun ? 'would also trim' : 'also trimmed';
+    ctx.stderr(`# ${verb} ${r.attachments.length} ${word}\n`);
+  }
   return 0;
 }
 

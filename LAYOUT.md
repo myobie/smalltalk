@@ -79,10 +79,30 @@ plain `ls` / `cat`. Their schema and interpretation are the
 participants' concern, not coord's — coord guarantees only that the
 bytes arrive and that the shared prefix is preserved.
 
-There is no first-class "attachment" verb in the current CLI; archive,
-sweep, and read operate on the canonical `.md` file. Tooling that
-wants to keep attachments lifecycle-coupled to their message file can
-glob the prefix.
+Lifecycle is opt-in by default. Bare `archive`, `read`, and `trim`
+operate on the canonical `.md` file only — tooling that wants
+attachments coupled passes `--with-attachments` (see below). Without
+that flag, attachments stay where they were written; coord doesn't
+move or reclaim them.
+
+- `coord message archive <file> --with-attachments` moves every
+  prefix-sibling alongside the `.md`. Atomic on conflict: if any
+  sibling has a divergent archive twin, the whole operation refuses
+  before moving anything.
+- `coord message archive trim --with-attachments` deletes archive
+  prefix-siblings whose `.md` is being trimmed.
+- `coord message ls --orphans` lists prefix-siblings in the folder
+  (inbox by default, archive with `--archive`) whose canonical `.md`
+  is no longer present — i.e. files left behind by an earlier bare
+  `archive`.
+- `sweep` extends the tombstone invariant to prefix-siblings: an
+  inbox sibling byte-identical to an archive twin is removed iff a
+  matching `archive/X.md` exists. This keeps the family from
+  resurrecting on the next `rsync` after `archive --with-attachments`.
+
+This is all opt-in surface — bare `archive` still leaves siblings
+behind, matching pre-issue-#8 semantics for callers that prefer to
+own attachment lifecycle themselves.
 
 ## File contents
 
@@ -177,6 +197,13 @@ This is the one subtle rule that makes plain bidirectional `rsync` converge
 correctly across machines:
 
 > If `archive/X.md` exists on this machine, then `inbox/X.md` must not.
+>
+> The same rule extends to prefix-sibling attachments (issue #8): an
+> inbox `X.<ext>` byte-identical to an `archive/X.<ext>` is removed
+> by `sweep` iff a matching `archive/X.md` exists, so the family is
+> reclaimed together when `archive --with-attachments` is used. Bare
+> `archive` doesn't move siblings, so this generalization is a no-op
+> for callers who keep attachments out-of-band.
 
 **Sweep is a convergence operation, not transactional.** It restores
 the invariant in three places: (1) on-demand via `coord sweep`;

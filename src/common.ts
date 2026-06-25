@@ -186,6 +186,28 @@ export function filenameTimestamp(s: string): number {
   return Number(s.slice(0, 13));
 }
 
+/**
+ * The shared `<unix-ms>-<rand6>` prefix of a message file or attachment
+ * sibling — 20 characters: `1719012345-abc123`. Used to associate
+ * prefix-siblings with their canonical `.md` (LAYOUT-004 §Attachments).
+ *
+ * Returns the prefix iff `name` starts with the LAYOUT-004 grammar
+ * followed by `.` and at least one suffix character. Returns `null` for
+ * random files in inbox/archive (e.g. `.DS_Store`, `README`) so callers
+ * can safely ignore non-message entries.
+ *
+ * Examples:
+ *   prefixOf('1719012345-abc123.md')           → '1719012345-abc123'
+ *   prefixOf('1719012345-abc123.options.json') → '1719012345-abc123'
+ *   prefixOf('1719012345-abc123')              → null  (no extension)
+ *   prefixOf('readme.md')                      → null
+ */
+const PREFIX_PART_RE = /^([0-9]{13}-[0-9a-z]{6})\..+$/;
+export function prefixOf(name: string): string | null {
+  const m = PREFIX_PART_RE.exec(name);
+  return m ? m[1]! : null;
+}
+
 // ─── Identity ────────────────────────────────────────────────────────────
 
 export function validIdentity(s: string): boolean {
@@ -552,6 +574,12 @@ export interface SweepResult {
  * `<id>/archive/X.md` under `coordRoot`, remove `<id>/inbox/X.md` if it
  * is byte-identical to the archive copy. Skips divergent pairs (a violated
  * invariant — likely manual edit; surfaced by archive case-3). Idempotent.
+ *
+ * Issue #8 extension: the rule also applies to prefix-sibling attachments
+ * — `archive/X.options.json` byte-identical to `inbox/X.options.json`
+ * is removed from inbox iff a matching `archive/X.md` exists, so the
+ * file is recognized as part of a real coord message family rather than
+ * an unrelated user-dropped file.
  */
 export function sweep(rootArg?: string): SweepResult {
   const root = rootArg ?? coordRoot();
@@ -572,8 +600,18 @@ export function sweep(rootArg?: string): SweepResult {
     } catch {
       continue;
     }
+    // Coord-owned: a `.md` matching LAYOUT-004 grammar, OR an attachment
+    // whose prefix matches one. This filter is what prevents sweep from
+    // acting on random files a user manually dropped into archive/.
+    const mdPrefixes = new Set<string>();
     for (const name of archEntries) {
-      if (!validFilename(name)) continue;
+      if (validFilename(name)) mdPrefixes.add(name.slice(0, 20));
+    }
+    for (const name of archEntries) {
+      const isMd = validFilename(name);
+      const pre = isMd ? null : prefixOf(name);
+      const isFamily = isMd || (pre !== null && mdPrefixes.has(pre));
+      if (!isFamily) continue;
       const inboxPath = join(root, id, 'inbox', name);
       const archivePath = join(archDir, name);
       if (!existsSync(inboxPath)) continue;

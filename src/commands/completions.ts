@@ -84,6 +84,7 @@ const COMMANDS: readonly CommandSpec[] = [
           { name: 'count', desc: 'Print count only' },
           { name: 'from', desc: 'Filter by sender' },
           { name: 'since', desc: 'Only since UNIX_MS' },
+          { name: 'orphans', desc: 'List orphan prefix-sibling attachments' },
           JSON_FLAG,
         ],
       },
@@ -101,9 +102,15 @@ const COMMANDS: readonly CommandSpec[] = [
         // trim-only flags (`--older-than`/`--keep-last`/`--dry-run`) only
         // apply after the `trim` token, so they're intentionally not
         // offered on bare `archive` to avoid completing them one level
-        // early.
+        // early. `--with-attachments` (issue #8) is shared between the two.
         name: 'archive',
         desc: 'Archive (or trim archived) messages',
+        flags: [
+          {
+            name: 'with-attachments',
+            desc: 'Also move/trim prefix-sibling attachments',
+          },
+        ],
       },
       {
         name: 'thread',
