@@ -454,6 +454,34 @@ export function resourcesDir(id: string, root: string = coordRoot()): string {
   return join(root, id, 'resources');
 }
 
+// brief-024 (context/ v1): per-agent durable working-state, the in-context-
+// state leg of lossless-restart. Two files:
+//   now.md         — whole-file rewrite; last-write-wins snapshot of
+//                    "what I'm mid-doing right now"
+//   decisions.md   — append-only bulleted log of decisions + why
+// Both are absent-able: missing folder / missing files must not crash
+// callers. Every helper reflects that — reads on absence return empty,
+// writes lazy-create the folder. Rationale: the restart-continuity eval
+// needs a control arm with no `context/` that fails exactly like an
+// unrestored agent, plus a treatment arm that resumes cleanly.
+export function contextDir(id: string, root: string = coordRoot()): string {
+  return join(root, id, 'context');
+}
+
+export function contextNowPath(
+  id: string,
+  root: string = coordRoot()
+): string {
+  return join(contextDir(id, root), 'now.md');
+}
+
+export function contextDecisionsPath(
+  id: string,
+  root: string = coordRoot()
+): string {
+  return join(contextDir(id, root), 'decisions.md');
+}
+
 export function statusPath(id: string, root: string = coordRoot()): string {
   return join(root, id, 'status');
 }
